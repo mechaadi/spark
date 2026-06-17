@@ -123,6 +123,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
   private uMaxStdDev: { value: number } | null = null;
   private uMinAlpha: { value: number } | null = null;
   private uMaxPixelRadius: { value: number } | null = null;
+  private uMaxSplatScale: { value: number } | null = null;
   // Radial view-distance range of the model, recomputed per frame from the
   // object-space bounding sphere, so the 16-bit depth key resolves finely.
   private uDepthMin: { value: number } | null = null;
@@ -141,6 +142,12 @@ export class WebGPUSplatRenderer extends THREE.Group {
   private readonly tmpSize = new THREE.Vector2();
 
   maxStdDev = Math.sqrt(8.0);
+  /**
+   * Cull splats whose largest object-space scale exceeds this, to trim the big
+   * diffuse "floater" blobs common in real captures. `Infinity` (default) keeps
+   * everything; lower it toward the model size to remove background haze.
+   */
+  maxSplatScale = Number.POSITIVE_INFINITY;
   minAlpha = 0.5 * (1.0 / 255.0);
   maxPixelRadius = 512.0;
   /** Evaluate SH color (read on the next `setSplatMesh`). */
@@ -324,6 +331,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
     const uMaxStdDev = uniform(this.maxStdDev);
     const uMinAlpha = uniform(this.minAlpha);
     const uMaxPixelRadius = uniform(this.maxPixelRadius);
+    const uMaxSplatScale = uniform(1e30);
     const uDepthMin = uniform(0.0);
     const uDepthMax = uniform(1.0);
     this.uDepthMin = uDepthMin as unknown as { value: number };
@@ -338,6 +346,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
     this.uMaxStdDev = uMaxStdDev as unknown as { value: number };
     this.uMinAlpha = uMinAlpha as unknown as { value: number };
     this.uMaxPixelRadius = uMaxPixelRadius as unknown as { value: number };
+    this.uMaxSplatScale = uMaxSplatScale as unknown as { value: number };
 
     // SH evaluation kernels + storage stores (only the bands the mesh has).
     const sh1Eval = this.numSh >= 1 ? wgslFn(WGSL_EVAL_SH1) : null;
@@ -396,6 +405,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
       const active = viewC.z
         .lessThan(0.0)
         .and(maxScale.greaterThan(0.0))
+        .and(maxScale.lessThanEqual(uMaxSplatScale))
         .and(a.greaterThanEqual(uMinAlpha));
       If(active, () => {
         const clip = uProjection.mul(vec4(viewC, 1.0)).toVar();
@@ -743,6 +753,11 @@ export class WebGPUSplatRenderer extends THREE.Group {
     (this.uMaxStdDev as { value: number }).value = this.maxStdDev;
     (this.uMinAlpha as { value: number }).value = this.minAlpha;
     (this.uMaxPixelRadius as { value: number }).value = this.maxPixelRadius;
+    (this.uMaxSplatScale as { value: number }).value = Number.isFinite(
+      this.maxSplatScale,
+    )
+      ? this.maxSplatScale
+      : 1e30;
 
     // View-space radial-distance range of the model's bounding sphere, used to
     // normalize the 16-bit depth key. The view-space radius scales by the
