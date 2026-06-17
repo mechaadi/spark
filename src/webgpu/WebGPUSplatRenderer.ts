@@ -14,15 +14,17 @@ import {
   WGSL_UNPACK_SCALES,
 } from "./wgsl";
 
-// Tiling for the GPU LSD radix sort: each tile owns a disjoint span of TILE
-// elements and a disjoint output range, so no atomics or barriers are needed.
-const TILE = 256; // elements per tile
-const RADIX_BITS = 8;
-const RADIX = 1 << RADIX_BITS; // 256 buckets
-const RADIX_PASSES = 32 / RADIX_BITS; // 4 passes over a 32-bit key
-// Blocks for the 2-level parallel prefix sum over the per-tile histogram, so the
-// scan is O(histLen / SCAN_BLOCKS) parallel work instead of O(histLen) serial.
+// Single-pass GPU counting sort over a 16-bit depth key (top 16 bits of the
+// 32-bit far->near sort key). One pass means stability is not required, so the
+// histogram + scatter can use atomics — only ~4 compute dispatches per frame
+// (vs a multi-pass radix), and no inter-dispatch data race.
+const DEPTH_BITS = 16;
+const BUCKETS = 1 << DEPTH_BITS; // 65536
+// The bucket prefix sum is a 2-level scan so it runs in parallel instead of one
+// serial pass over all 65536 buckets (which is a fixed per-frame cost that
+// otherwise dominates the frame regardless of splat count).
 const SCAN_BLOCKS = 1024;
+const SCAN_BLOCK_SIZE = BUCKETS / SCAN_BLOCKS; // 64
 
 // `three/tsl` and `three/webgpu` are loaded via dynamic import (see `load()`),
 // never as static imports, so the default WebGL build does not force WebGL-only
@@ -84,14 +86,12 @@ export class WebGPUSplatRenderer extends THREE.Group {
   // GPU storage buffers.
   private packedAttr: StorageBufferAttribute | null = null;
   private projAttr: StorageBufferAttribute | null = null;
-  // Radix-sort ping-pong key + payload (splat index) buffers, plus per-tile
-  // histogram / scanned-offset scratch. The final sorted index lands in idxA.
+  // Counting-sort buffers: per-splat 16-bit depth key, the sorted order output
+  // (idxA, read by the raster), and the atomic bucket histogram + scanned offset.
   private keyA: StorageBufferAttribute | null = null;
-  private keyB: StorageBufferAttribute | null = null;
   private idxA: StorageBufferAttribute | null = null;
-  private idxB: StorageBufferAttribute | null = null;
-  private tileHist: StorageBufferAttribute | null = null;
-  private tileBase: StorageBufferAttribute | null = null;
+  private hist: StorageBufferAttribute | null = null;
+  private offset: StorageBufferAttribute | null = null;
   private blockSum: StorageBufferAttribute | null = null;
   private blockBase: StorageBufferAttribute | null = null;
   // Spherical-harmonics coefficient buffers (present iff the mesh has SH).
@@ -177,8 +177,6 @@ export class WebGPUSplatRenderer extends THREE.Group {
     const numSplats = packed.numSplats;
     this.numSplats = numSplats;
     const packedArray = packed.packedArray.subarray(0, numSplats * 4);
-    const numTiles = Math.ceil(numSplats / TILE);
-    const histLen = numTiles * RADIX;
 
     const { StorageBufferAttribute, MeshBasicNodeMaterial } = this.wgpu;
 
@@ -193,13 +191,12 @@ export class WebGPUSplatRenderer extends THREE.Group {
       new Float32Array(numSplats * 16),
       4,
     );
-    // Radix-sort ping-pong buffers + per-tile histogram/offset scratch.
+    // Counting-sort buffers: 16-bit key per splat, sorted order (idxA, read by
+    // the raster), and the atomic histogram + scanned offset (BUCKETS entries).
     this.keyA = new StorageBufferAttribute(new Uint32Array(numSplats), 1);
-    this.keyB = new StorageBufferAttribute(new Uint32Array(numSplats), 1);
     this.idxA = new StorageBufferAttribute(new Uint32Array(numSplats), 1);
-    this.idxB = new StorageBufferAttribute(new Uint32Array(numSplats), 1);
-    this.tileHist = new StorageBufferAttribute(new Uint32Array(histLen), 1);
-    this.tileBase = new StorageBufferAttribute(new Uint32Array(histLen), 1);
+    this.hist = new StorageBufferAttribute(new Uint32Array(BUCKETS), 1);
+    this.offset = new StorageBufferAttribute(new Uint32Array(BUCKETS), 1);
     this.blockSum = new StorageBufferAttribute(new Uint32Array(SCAN_BLOCKS), 1);
     this.blockBase = new StorageBufferAttribute(
       new Uint32Array(SCAN_BLOCKS),
@@ -234,7 +231,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
       }
     }
 
-    this.buildPipeline(numTiles);
+    this.buildPipeline();
     const material = this.buildMaterial(MeshBasicNodeMaterial);
 
     const geometry = makeQuadGeometry(numSplats);
@@ -244,7 +241,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
     this.add(drawMesh);
   }
 
-  private buildPipeline(numTiles: number): void {
+  private buildPipeline(): void {
     const tsl = this.tsl as TSL;
     const {
       Fn,
@@ -264,9 +261,11 @@ export class WebGPUSplatRenderer extends THREE.Group {
       min,
       max,
       sqrt,
+      atomicAdd,
+      atomicLoad,
+      atomicStore,
     } = tsl;
     const N = this.numSplats;
-    const histLen = numTiles * RADIX;
 
     const unpackCenter = wgslFn(WGSL_UNPACK_CENTER);
     const unpackRgba = wgslFn(WGSL_UNPACK_RGBA);
@@ -280,15 +279,11 @@ export class WebGPUSplatRenderer extends THREE.Group {
     const packedStore = storage(sba(this.packedAttr), "uvec4", N).toReadOnly();
     const projStore = storage(sba(this.projAttr), "vec4", N * 4);
     const keyAStore = storage(sba(this.keyA), "uint", N);
-    const keyBStore = storage(sba(this.keyB), "uint", N);
     const idxAStore = storage(sba(this.idxA), "uint", N);
-    const idxBStore = storage(sba(this.idxB), "uint", N);
-    const histStore = storage(sba(this.tileHist), "uint", histLen);
-    const baseStore = storage(sba(this.tileBase), "uint", histLen);
+    const histStore = storage(sba(this.hist), "uint", BUCKETS).toAtomic();
+    const offsetStore = storage(sba(this.offset), "uint", BUCKETS).toAtomic();
     const blockSumStore = storage(sba(this.blockSum), "uint", SCAN_BLOCKS);
     const blockBaseStore = storage(sba(this.blockBase), "uint", SCAN_BLOCKS);
-    // Per-block span of the digit-major histogram for the 2-level scan.
-    const scanBlockSize = Math.ceil(histLen / SCAN_BLOCKS);
 
     const uModelView = uniform(new THREE.Matrix4());
     const uModelView3 = uniform(new THREE.Matrix3());
@@ -344,10 +339,9 @@ export class WebGPUSplatRenderer extends THREE.Group {
       projStore.element(base.add(2)).assign(zero);
       projStore.element(base.add(3)).assign(zero);
 
-      // Identity payload; inactive splats get the max key so they sort last
+      // Inactive splats get the max 16-bit key so they sort to the last bucket
       // (and are discarded by the raster via projected.active == 0).
-      idxAStore.element(i).assign(i);
-      keyAStore.element(i).assign(uint(0xffffffff));
+      keyAStore.element(i).assign(uint(BUCKETS - 1));
 
       const viewC = uModelView.mul(vec4(center, 1.0)).xyz.toVar();
       const a = rgba.w.mul(2.0).toVar();
@@ -428,128 +422,72 @@ export class WebGPUSplatRenderer extends THREE.Group {
             .element(base.add(2))
             .assign(vec4(rgb.x, rgb.y, rgb.z, alpha));
           projStore.element(base.add(3)).assign(vec4(adj, 1.0, 0.0, 0.0));
-          keyAStore.element(i).assign(depthKey(viewC.length()));
+          // 16-bit depth key = top 16 bits of the 32-bit far->near key.
+          keyAStore.element(i).assign(depthKey(viewC.length()).shiftRight(16));
         });
       });
     });
 
-    // --- Radix sort kernels (one tile per invocation) ---
-    // Per-tile histogram of the current 8-bit digit, written digit-major so a
-    // single linear prefix sum over the whole array yields each (digit, tile)'s
-    // global base offset.
-    const countKernel = (keyIn: typeof keyAStore, shift: number) =>
-      Fn(() => {
-        const t = instanceIndex;
-        const hist = tsl.array("uint", RADIX).toVar();
-        Loop(RADIX, ({ i }) => {
-          hist.element(uint(i)).assign(uint(0));
-        });
-        const start = t.mul(TILE);
-        Loop(TILE, ({ i }) => {
-          const e = start.add(i);
-          If(e.lessThan(N), () => {
-            const digit = keyIn
-              .element(e)
-              .shiftRight(shift)
-              .bitAnd(RADIX - 1);
-            hist.element(digit).assign(hist.element(digit).add(1));
-          });
-        });
-        Loop(RADIX, ({ i }) => {
-          const d = uint(i);
-          histStore.element(d.mul(numTiles).add(t)).assign(hist.element(d));
-        });
+    // --- Single-pass counting sort over the 16-bit depth key ---
+    // clearHist: zero every histogram bucket (offset is fully (re)written by the
+    // scan, so it needs no clear).
+    const clearHist = Fn(() => {
+      atomicStore(histStore.element(instanceIndex), uint(0));
+    });
+    // count: tally each splat into its depth bucket.
+    const count = Fn(() => {
+      atomicAdd(histStore.element(keyAStore.element(instanceIndex)), uint(1));
+    });
+    // scan: exclusive prefix sum hist -> offset (each bucket's first write
+    // position) as a 2-level scan so it is parallel, not one serial pass over
+    // all 65536 buckets. (1) each block sums its span -> blockSum, (2) one
+    // invocation scans the block sums -> blockBase, (3) each block scans its
+    // span seeded with its base -> offset.
+    const scanReduce = Fn(() => {
+      const start = instanceIndex.mul(SCAN_BLOCK_SIZE);
+      const sum = uint(0).toVar();
+      Loop(SCAN_BLOCK_SIZE, ({ i }) => {
+        sum.assign(sum.add(atomicLoad(histStore.element(start.add(i)))));
       });
+      blockSumStore.element(instanceIndex).assign(sum);
+    });
+    const scanBlocks = Fn(() => {
+      const running = uint(0).toVar();
+      Loop(SCAN_BLOCKS, ({ i }) => {
+        blockBaseStore.element(uint(i)).assign(running);
+        running.assign(running.add(blockSumStore.element(uint(i))));
+      });
+    });
+    const scanDown = Fn(() => {
+      const start = instanceIndex.mul(SCAN_BLOCK_SIZE);
+      const running = blockBaseStore.element(instanceIndex).toVar();
+      Loop(SCAN_BLOCK_SIZE, ({ i }) => {
+        const e = start.add(i);
+        atomicStore(offsetStore.element(e), running);
+        running.assign(running.add(atomicLoad(histStore.element(e))));
+      });
+    });
+    // scatter: each splat atomically claims the next slot in its bucket and
+    // writes its index there. Unstable within a bucket, which is fine for a
+    // single-pass sort (ties are at the same quantized depth).
+    const scatter = Fn(() => {
+      const i = instanceIndex;
+      const pos = atomicAdd(offsetStore.element(keyAStore.element(i)), uint(1));
+      idxAStore.element(pos).assign(i);
+    });
 
-    // Exclusive prefix sum over the digit-major histogram, as a 2-level scan:
-    // (1) each block sums its span, (2) one invocation scans the block sums,
-    // (3) each block scans its span seeded with its block base. This makes the
-    // scan parallel across SCAN_BLOCKS instead of a single serial pass.
-    const scanReduceKernel = () =>
-      Fn(() => {
-        const b = instanceIndex;
-        const start = b.mul(scanBlockSize);
-        const sum = uint(0).toVar();
-        Loop(scanBlockSize, ({ i }) => {
-          const e = start.add(i);
-          If(e.lessThan(histLen), () => {
-            sum.assign(sum.add(histStore.element(e)));
-          });
-        });
-        blockSumStore.element(b).assign(sum);
-      });
-    const scanBlockBaseKernel = () =>
-      Fn(() => {
-        const running = uint(0).toVar();
-        Loop(SCAN_BLOCKS, ({ i }) => {
-          blockBaseStore.element(uint(i)).assign(running);
-          running.assign(running.add(blockSumStore.element(uint(i))));
-        });
-      });
-    const scanDownKernel = () =>
-      Fn(() => {
-        const b = instanceIndex;
-        const start = b.mul(scanBlockSize);
-        const running = blockBaseStore.element(b).toVar();
-        Loop(scanBlockSize, ({ i }) => {
-          const e = start.add(i);
-          If(e.lessThan(histLen), () => {
-            baseStore.element(e).assign(running);
-            running.assign(running.add(histStore.element(e)));
-          });
-        });
-      });
-
-    // Stable scatter: each tile re-reads its digits and emits to the running
-    // global offset for that (digit, tile).
-    const scatterKernel = (
-      keyIn: typeof keyAStore,
-      idxIn: typeof idxAStore,
-      keyOut: typeof keyAStore,
-      idxOut: typeof idxAStore,
-      shift: number,
-    ) =>
-      Fn(() => {
-        const t = instanceIndex;
-        const offset = tsl.array("uint", RADIX).toVar();
-        Loop(RADIX, ({ i }) => {
-          const d = uint(i);
-          offset.element(d).assign(baseStore.element(d.mul(numTiles).add(t)));
-        });
-        const start = t.mul(TILE);
-        Loop(TILE, ({ i }) => {
-          const e = start.add(i);
-          If(e.lessThan(N), () => {
-            const key = keyIn.element(e);
-            const digit = key.shiftRight(shift).bitAnd(RADIX - 1);
-            const pos = offset.element(digit).toVar();
-            keyOut.element(pos).assign(key);
-            idxOut.element(pos).assign(idxIn.element(e));
-            offset.element(digit).assign(pos.add(1));
-          });
-        });
-      });
-
-    const nodes: unknown[] = [project().compute(N)];
-    let inKey = keyAStore;
-    let inIdx = idxAStore;
-    let outKey = keyBStore;
-    let outIdx = idxBStore;
-    for (let p = 0; p < RADIX_PASSES; p++) {
-      const shift = p * RADIX_BITS;
-      nodes.push(countKernel(inKey, shift)().compute(numTiles));
-      nodes.push(scanReduceKernel()().compute(SCAN_BLOCKS));
-      nodes.push(scanBlockBaseKernel()().compute(1));
-      nodes.push(scanDownKernel()().compute(SCAN_BLOCKS));
-      nodes.push(
-        scatterKernel(inKey, inIdx, outKey, outIdx, shift)().compute(numTiles),
-      );
-      [inKey, outKey] = [outKey, inKey];
-      [inIdx, outIdx] = [outIdx, inIdx];
-    }
-    // After an even number of passes the sorted payload is back in idxA, which
-    // the raster reads. (RADIX_PASSES is 4.)
-    this.computeNodes = nodes;
+    // project + clearHist are independent (disjoint buffers) -> one pass. count,
+    // scan, scatter form a read-after-write chain -> each its own pass, since
+    // THREE runs an array of compute nodes in ONE pass with no inter-dispatch
+    // barrier (separate passes are synchronized). Dispatched in prepareFrame.
+    this.computeNodes = [
+      [project().compute(N), clearHist().compute(BUCKETS)],
+      count().compute(N),
+      scanReduce().compute(SCAN_BLOCKS),
+      scanBlocks().compute(1),
+      scanDown().compute(SCAN_BLOCKS),
+      scatter().compute(N),
+    ];
   }
 
   private buildMaterial(
@@ -694,7 +632,14 @@ export class WebGPUSplatRenderer extends THREE.Group {
     (this.uMaxPixelRadius as { value: number }).value = this.maxPixelRadius;
 
     // GPU compute: project every splat, then radix-sort by depth in-frame.
-    this.renderer.compute(this.computeNodes as never);
+    // Each stage is dispatched as its own compute pass: THREE runs an array of
+    // compute nodes in a single WebGPU pass with no barrier between dispatches,
+    // but these stages have read-after-write dependencies (project -> count ->
+    // scan -> scatter). Separate passes are synchronized, avoiding the data
+    // race that otherwise makes the sort order vary frame to frame (flicker).
+    for (const node of this.computeNodes) {
+      this.renderer.compute(node as never);
+    }
   }
 
   /** Convenience: prepareFrame + renderer.renderAsync. */
@@ -718,11 +663,9 @@ export class WebGPUSplatRenderer extends THREE.Group {
     this.packedAttr = null;
     this.projAttr = null;
     this.keyA = null;
-    this.keyB = null;
     this.idxA = null;
-    this.idxB = null;
-    this.tileHist = null;
-    this.tileBase = null;
+    this.hist = null;
+    this.offset = null;
     this.blockSum = null;
     this.blockBase = null;
     this.sh1Attr = null;
