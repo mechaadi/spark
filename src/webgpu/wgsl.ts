@@ -54,3 +54,19 @@ fn sparkUnpackMaxScale( packed : vec4<u32> ) -> f32 {
   return max( fx, max( fy, fz ) );
 }
 `;
+
+/**
+ * Map a non-negative depth (radial camera distance) to a 32-bit sort key such
+ * that ascending integer sort orders splats **far -> near** (painter's order).
+ *
+ * The classic float->sortable-uint flip (`bits ^ 0x80000000` for f >= 0) is
+ * monotonically increasing in depth; bit-inverting it makes the key decrease
+ * with depth, so the radix sort's ascending output draws farthest first.
+ */
+export const WGSL_DEPTH_KEY = /* wgsl */ `
+fn sparkDepthKey( depth : f32 ) -> u32 {
+  let u = bitcast<u32>( depth );
+  let mask = select( 0x80000000u, 0xffffffffu, ( u & 0x80000000u ) != 0u );
+  return ~( u ^ mask );
+}
+`;
