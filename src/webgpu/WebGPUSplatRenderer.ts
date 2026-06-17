@@ -548,9 +548,11 @@ export class WebGPUSplatRenderer extends THREE.Group {
       instanceIndex,
       positionGeometry,
       vec4,
+      float,
       varyingProperty,
       storage,
       mix,
+      select,
     } = tsl;
 
     const projStore = storage(
@@ -567,6 +569,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
 
     const vColor = varyingProperty("vec4", "vSplatColor");
     const vUv = varyingProperty("vec2", "vSplatUv");
+    const vStd = varyingProperty("float", "vSplatStd");
     const uMinAlpha = this.uMinAlpha as { value: number };
 
     const material = new MeshBasicNodeMaterial();
@@ -587,6 +590,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
       const corner = positionGeometry.xy;
       vColor.assign(p2);
       vUv.assign(corner.mul(meta.x));
+      vStd.assign(meta.x); // adjustedStdDev
 
       const off = corner.x.mul(p1.xy).add(corner.y.mul(p1.zw));
       const clipW = p0.w;
@@ -597,15 +601,34 @@ export class WebGPUSplatRenderer extends THREE.Group {
     })();
 
     material.fragmentNode = Fn(() => {
+      // Port of splatFragment.glsl. Circular cutoff, then the two falloff
+      // profiles: a<=1 is a plain Gaussian; a>1 (high-opacity / LOD-inflated
+      // splats) uses the bounded profile so alpha stays in [0,1] — without this
+      // high-opacity splats render as hard, over-bright, non-blending dots.
       const z2 = vUv.dot(vUv);
-      const alpha = vColor.w.mul(z2.mul(-0.5).exp()).toVar();
+      If(z2.greaterThan(vStd.mul(vStd)), () => {
+        Discard();
+      });
+      const a = vColor.w;
+      const fall = z2.mul(-0.5).exp();
+      const aLow = a.mul(fall);
+      const expo = a.mul(a).sub(1.0).div(Math.E).exp();
+      const aHigh = float(1.0).sub(float(1.0).sub(fall).pow(expo));
+      const alpha = select(a.greaterThan(1.0), aHigh, aLow).toVar();
       If(alpha.lessThan(uMinAlpha.value), () => {
         Discard();
       });
-      // Match Spark's WebGL fragment (encodeLinear): the stored splat color is
-      // sRGB; convert to linear so WebGPURenderer's linear->sRGB output yields
-      // the same on-screen color. max(0) guards against negative SH lobes.
-      const linear = vColor.xyz.max(0.0).pow(2.2);
+      // The stored splat color is sRGB, but WebGPURenderer applies an output
+      // linear->sRGB (sRGB OETF) conversion to the fragment color. Apply the
+      // exact sRGB EOTF (sRGB->linear) here so the two cancel and the on-screen
+      // color equals the stored sRGB value, matching the WebGL path.
+      // max(0) guards against negative SH lobes.
+      const c = vColor.xyz.max(0.0);
+      const linear = select(
+        c.lessThanEqual(0.04045),
+        c.div(12.92),
+        c.add(0.055).div(1.055).pow(2.4),
+      );
       return vec4(linear.mul(alpha), alpha);
     })();
 
