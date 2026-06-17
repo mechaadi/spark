@@ -337,9 +337,24 @@
         recenterTarget();
       }
     });
-    renderFolder.add(spark, "maxStdDev", 0.5, 4, 0.01).name("Max Gsplat stddev");
-    renderFolder.add(spark, "minAlpha", 0, 0.1, 0.0005).name("Min alpha");
+    renderFolder.add(spark, "maxStdDev", 0.5, 4, 0.01).name("Max Gsplat stddev").listen();
+    renderFolder.add(spark, "minAlpha", 0, 0.1, 0.0005).name("Min alpha").listen();
     renderFolder.add(spark, "maxPixelRadius", 16, 1024, 1).name("Max pixel radius");
+    // Presets: "Spark default" matches the WebGL path (wide Gaussians, keep
+    // almost everything); "Crisp" tightens the Gaussian cutoff and culls faint
+    // floaters for a sharper, SuperSplat-like look.
+    renderFolder.add({
+      crisp: () => {
+        spark.maxStdDev = 1.7;
+        spark.minAlpha = 0.02;
+      },
+    }, "crisp").name("Preset: Crisp");
+    renderFolder.add({
+      sparkDefault: () => {
+        spark.maxStdDev = Math.sqrt(8);
+        spark.minAlpha = 0.5 / 255;
+      },
+    }, "sparkDefault").name("Preset: Spark default");
 
     // --- File input + drag/drop ------------------------------------------
     const fileInput = document.getElementById("file-input");
