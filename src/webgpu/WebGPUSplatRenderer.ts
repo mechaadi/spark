@@ -16,8 +16,8 @@ import {
 
 // Single-pass GPU counting sort over a 16-bit depth key (top 16 bits of the
 // 32-bit far->near sort key). One pass means stability is not required, so the
-// histogram + scatter can use atomics — only ~4 compute dispatches per frame
-// (vs a multi-pass radix), and no inter-dispatch data race.
+// histogram + scatter can use atomics — a handful of compute dispatches per
+// frame (vs a multi-pass radix), and no inter-dispatch data race.
 const DEPTH_BITS = 16;
 const BUCKETS = 1 << DEPTH_BITS; // 65536
 // The bucket prefix sum is a 2-level scan so it runs in parallel instead of one
@@ -52,14 +52,14 @@ export interface WebGPUSplatRendererOptions {
  * Renders a SplatMesh entirely on the GPU through THREE.WebGPURenderer:
  * packed-splat storage-buffer upload, a per-splat compute project pass (full
  * anisotropic 2D-covariance projection + SH<=3 view-dependent color), an
- * **in-frame GPU LSD radix sort** of depth keys, and an instanced raster draw
- * into the scene's shared depth buffer. The sort is produced and consumed in the
- * same frame — no GPU->CPU readback, no worker round-trip, no sort lag.
+ * **in-frame GPU counting sort** by depth, and an instanced raster draw into the
+ * scene's shared depth buffer. The sort is produced and consumed in the same
+ * frame — no GPU->CPU readback, no worker round-trip, no sort lag.
  *
  * Scope/caveats (documented, replaced in later phases):
- * - The radix sort uses a one-tile-per-invocation count/scatter with a 2-level
- *   parallel prefix-sum scan (no atomics). A workgroup-shared layout could
- *   reduce the size-1 dispatch overhead further.
+ * - Sort is a single-pass counting sort over a 16-bit depth key (atomic
+ *   histogram + scatter, parallel prefix sum). 16-bit depth is enough for the
+ *   tested scenes; a wider key or workgroup-shared layout is a future option.
  * - Only `PackedSplats` residency is supported here; ExtSplats/Paged are routed
  *   to the WebGL session per the design (directives D4/D5/D6).
  *
