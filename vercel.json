@@ -1,0 +1,7 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "installCommand": "npm install --include=dev --ignore-scripts",
+  "buildCommand": "node scripts/build-examples-site.js",
+  "outputDirectory": "examples-site",
+  "framework": null
+}
