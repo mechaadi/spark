@@ -201,6 +201,16 @@
       background: "#000000",
       showStats: false,
       openFile: () => fileInput.click(),
+      url: "",
+      loadFromUrl: () => {
+        const u = guiOptions.url.trim();
+        if (!u) return;
+        if (!/^https?:\/\//.test(u)) {
+          alert("Enter an http(s):// URL to a .ply/.spz/.splat/.ksplat/.zip/.sog/.rad file.");
+          return;
+        }
+        loadSource(u);
+      },
       resetPose: () => {
         camera.position.set(0, 0, 3);
         controls.target.set(0, 0, 0);
@@ -212,6 +222,8 @@
 
     const fileFolder = gui.addFolder("Scene");
     fileFolder.add(guiOptions, "openFile").name("Open file…");
+    fileFolder.add(guiOptions, "url").name("URL");
+    fileFolder.add(guiOptions, "loadFromUrl").name("Load from URL");
     fileFolder.add(guiOptions, "source").name("Loaded").listen().disable();
     fileFolder.add(guiOptions, "splatCount").name("Splats").listen().disable();
 
