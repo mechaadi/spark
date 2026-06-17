@@ -273,6 +273,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
     const {
       Fn,
       If,
+      Return,
       Loop,
       instanceIndex,
       vec2,
@@ -358,6 +359,13 @@ export class WebGPUSplatRenderer extends THREE.Group {
     // 2D covariance, eigen-decompose it into screen-space ellipse axes.
     const project = Fn(() => {
       const i = instanceIndex;
+      // THREE dispatches ceil(count/workgroupSize) full workgroups with no range
+      // guard, so when N isn't a multiple of the workgroup size the extra padding
+      // invocations would write out of bounds (clamped/racing) -> garbage that
+      // varies frame to frame on real hardware. Bail out of the over-run lanes.
+      If(i.greaterThanEqual(uint(N)), () => {
+        Return();
+      });
       const pk = packedStore.element(i);
       const center = unpackCenter(pk);
       const rgba = unpackRgba(pk);
@@ -470,6 +478,9 @@ export class WebGPUSplatRenderer extends THREE.Group {
     const countKernel = (keyIn: typeof keyAStore, shift: number) =>
       Fn(() => {
         const t = instanceIndex;
+        If(t.greaterThanEqual(uint(numTiles)), () => {
+          Return();
+        });
         const hist = tsl.array("uint", RADIX).toVar();
         Loop(RADIX, ({ i }) => {
           hist.element(uint(i)).assign(uint(0));
@@ -493,6 +504,9 @@ export class WebGPUSplatRenderer extends THREE.Group {
 
     // 2-level exclusive prefix sum over the digit-major histogram -> tileBase.
     const scanReduce = Fn(() => {
+      If(instanceIndex.greaterThanEqual(uint(SCAN_BLOCKS)), () => {
+        Return();
+      });
       const start = instanceIndex.mul(scanBlockSize);
       const sum = uint(0).toVar();
       Loop(scanBlockSize, ({ i }) => {
@@ -504,6 +518,13 @@ export class WebGPUSplatRenderer extends THREE.Group {
       blockSumStore.element(instanceIndex).assign(sum);
     });
     const scanBlocks = Fn(() => {
+      // Dispatched with count 1, but THREE still launches a full workgroup, so
+      // every lane but 0 must bail — otherwise 64 invocations race writing the
+      // same serial prefix sum into blockBaseStore (the worst offender: this
+      // dispatch is *always* padded regardless of N).
+      If(instanceIndex.greaterThanEqual(uint(1)), () => {
+        Return();
+      });
       const running = uint(0).toVar();
       Loop(SCAN_BLOCKS, ({ i }) => {
         blockBaseStore.element(uint(i)).assign(running);
@@ -511,6 +532,9 @@ export class WebGPUSplatRenderer extends THREE.Group {
       });
     });
     const scanDown = Fn(() => {
+      If(instanceIndex.greaterThanEqual(uint(SCAN_BLOCKS)), () => {
+        Return();
+      });
       const start = instanceIndex.mul(scanBlockSize);
       const running = blockBaseStore.element(instanceIndex).toVar();
       Loop(scanBlockSize, ({ i }) => {
@@ -534,6 +558,9 @@ export class WebGPUSplatRenderer extends THREE.Group {
     ) =>
       Fn(() => {
         const t = instanceIndex;
+        If(t.greaterThanEqual(uint(numTiles)), () => {
+          Return();
+        });
         const offset = tsl.array("uint", RADIX).toVar();
         Loop(RADIX, ({ i }) => {
           const d = uint(i);
