@@ -125,6 +125,65 @@ fn sparkCov2D( mv3 : mat3x3<f32>, s : vec3<f32>, q : vec4<f32>, focal : vec2<f32
 }
 `;
 
+// Spherical-harmonics evaluation, ported 1:1 from defineEvalPackedSH{1,2,3} in
+// PackedSplats.ts. `dir` is the object-space direction from camera to splat.
+// Signed coefficients are sign-extended via bitcast + arithmetic shift.
+
+/** SH band 1 (3 coeffs, sint7 in 2x u32), scaled by sh1Max/63. */
+export const WGSL_EVAL_SH1 = /* wgsl */ `
+fn sparkEvalSH1( d : vec2<u32>, dir : vec3<f32>, shMax : f32 ) -> vec3<f32> {
+  let x = d.x; let y = d.y;
+  let c0 = vec3<f32>( f32( bitcast<i32>( x << 25u ) >> 25u ), f32( bitcast<i32>( x << 18u ) >> 25u ), f32( bitcast<i32>( x << 11u ) >> 25u ) );
+  let c1 = vec3<f32>( f32( bitcast<i32>( x << 4u ) >> 25u ), f32( bitcast<i32>( ( x >> 3u ) | ( y << 29u ) ) >> 25u ), f32( bitcast<i32>( y << 22u ) >> 25u ) );
+  let c2 = vec3<f32>( f32( bitcast<i32>( y << 15u ) >> 25u ), f32( bitcast<i32>( y << 8u ) >> 25u ), f32( bitcast<i32>( y << 1u ) >> 25u ) );
+  let rgb = c0 * ( -0.4886025 * dir.y ) + c1 * ( 0.4886025 * dir.z ) + c2 * ( -0.4886025 * dir.x );
+  return rgb * ( shMax / 63.0 );
+}
+`;
+
+/** SH band 2 (5 coeffs, sint8 in 4x u32), scaled by sh2Max/127. */
+export const WGSL_EVAL_SH2 = /* wgsl */ `
+fn sparkEvalSH2( d : vec4<u32>, dir : vec3<f32>, shMax : f32 ) -> vec3<f32> {
+  let x = d.x; let y = d.y; let z = d.z; let w = d.w;
+  let c0 = vec3<f32>( f32( bitcast<i32>( x << 24u ) >> 24u ), f32( bitcast<i32>( x << 16u ) >> 24u ), f32( bitcast<i32>( x << 8u ) >> 24u ) );
+  let c1 = vec3<f32>( f32( bitcast<i32>( x ) >> 24u ), f32( bitcast<i32>( y << 24u ) >> 24u ), f32( bitcast<i32>( y << 16u ) >> 24u ) );
+  let c2 = vec3<f32>( f32( bitcast<i32>( y << 8u ) >> 24u ), f32( bitcast<i32>( y ) >> 24u ), f32( bitcast<i32>( z << 24u ) >> 24u ) );
+  let c3 = vec3<f32>( f32( bitcast<i32>( z << 16u ) >> 24u ), f32( bitcast<i32>( z << 8u ) >> 24u ), f32( bitcast<i32>( z ) >> 24u ) );
+  let c4 = vec3<f32>( f32( bitcast<i32>( w << 24u ) >> 24u ), f32( bitcast<i32>( w << 16u ) >> 24u ), f32( bitcast<i32>( w << 8u ) >> 24u ) );
+  let xx = dir.x * dir.x; let yy = dir.y * dir.y; let zz = dir.z * dir.z;
+  let rgb = c0 * ( 1.0925484 * dir.x * dir.y )
+    + c1 * ( -1.0925484 * dir.y * dir.z )
+    + c2 * ( 0.3153915 * ( 2.0 * zz - xx - yy ) )
+    + c3 * ( -1.0925484 * dir.x * dir.z )
+    + c4 * ( 0.5462742 * ( xx - yy ) );
+  return rgb * ( shMax / 127.0 );
+}
+`;
+
+/** SH band 3 (7 coeffs, sint6 in 4x u32), scaled by sh3Max/31. */
+export const WGSL_EVAL_SH3 = /* wgsl */ `
+fn sparkEvalSH3( d : vec4<u32>, dir : vec3<f32>, shMax : f32 ) -> vec3<f32> {
+  let x = d.x; let y = d.y; let z = d.z; let w = d.w;
+  let c0 = vec3<f32>( f32( bitcast<i32>( x << 26u ) >> 26u ), f32( bitcast<i32>( x << 20u ) >> 26u ), f32( bitcast<i32>( x << 14u ) >> 26u ) );
+  let c1 = vec3<f32>( f32( bitcast<i32>( x << 8u ) >> 26u ), f32( bitcast<i32>( x << 2u ) >> 26u ), f32( bitcast<i32>( ( x >> 4u ) | ( y << 28u ) ) >> 26u ) );
+  let c2 = vec3<f32>( f32( bitcast<i32>( y << 22u ) >> 26u ), f32( bitcast<i32>( y << 16u ) >> 26u ), f32( bitcast<i32>( y << 10u ) >> 26u ) );
+  let c3 = vec3<f32>( f32( bitcast<i32>( y << 4u ) >> 26u ), f32( bitcast<i32>( ( y >> 2u ) | ( z << 30u ) ) >> 26u ), f32( bitcast<i32>( z << 24u ) >> 26u ) );
+  let c4 = vec3<f32>( f32( bitcast<i32>( z << 18u ) >> 26u ), f32( bitcast<i32>( z << 12u ) >> 26u ), f32( bitcast<i32>( z << 6u ) >> 26u ) );
+  let c5 = vec3<f32>( f32( bitcast<i32>( z ) >> 26u ), f32( bitcast<i32>( w << 26u ) >> 26u ), f32( bitcast<i32>( w << 20u ) >> 26u ) );
+  let c6 = vec3<f32>( f32( bitcast<i32>( w << 14u ) >> 26u ), f32( bitcast<i32>( w << 8u ) >> 26u ), f32( bitcast<i32>( w << 2u ) >> 26u ) );
+  let xx = dir.x * dir.x; let yy = dir.y * dir.y; let zz = dir.z * dir.z;
+  let xy = dir.x * dir.y;
+  let rgb = c0 * ( -0.5900436 * dir.y * ( 3.0 * xx - yy ) )
+    + c1 * ( 2.8906114 * xy * dir.z )
+    + c2 * ( -0.4570458 * dir.y * ( 4.0 * zz - xx - yy ) )
+    + c3 * ( 0.3731763 * dir.z * ( 2.0 * zz - 3.0 * xx - 3.0 * yy ) )
+    + c4 * ( -0.4570458 * dir.x * ( 4.0 * zz - xx - yy ) )
+    + c5 * ( 1.4453057 * dir.z * ( xx - yy ) )
+    + c6 * ( -0.5900436 * dir.x * ( xx - 3.0 * yy ) );
+  return rgb * ( shMax / 31.0 );
+}
+`;
+
 /**
  * Map a non-negative depth (radial camera distance) to a 32-bit sort key such
  * that ascending integer sort orders splats **far -> near** (painter's order).

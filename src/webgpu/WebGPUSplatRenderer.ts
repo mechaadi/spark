@@ -5,6 +5,9 @@ import type { SplatMesh } from "../SplatMesh";
 import {
   WGSL_COV2D,
   WGSL_DEPTH_KEY,
+  WGSL_EVAL_SH1,
+  WGSL_EVAL_SH2,
+  WGSL_EVAL_SH3,
   WGSL_UNPACK_CENTER,
   WGSL_UNPACK_QUAT,
   WGSL_UNPACK_RGBA,
@@ -36,14 +39,12 @@ export interface WebGPUSplatRendererOptions {
  *
  * Renders a SplatMesh entirely on the GPU through THREE.WebGPURenderer:
  * packed-splat storage-buffer upload, a per-splat compute project pass (full
- * anisotropic 2D-covariance projection), an **in-frame GPU LSD radix sort** of
- * depth keys, and an instanced raster draw into the scene's shared depth buffer.
- * The sort is produced and consumed in the same frame — no GPU->CPU readback, no
- * worker round-trip, no sort lag.
+ * anisotropic 2D-covariance projection + SH<=3 view-dependent color), an
+ * **in-frame GPU LSD radix sort** of depth keys, and an instanced raster draw
+ * into the scene's shared depth buffer. The sort is produced and consumed in the
+ * same frame — no GPU->CPU readback, no worker round-trip, no sort lag.
  *
  * Scope/caveats (documented, replaced in later phases):
- * - Spherical harmonics are not yet evaluated (flat base color); SH<=3 lands in
- *   Phase 4B.
  * - The radix sort uses a simple one-tile-per-invocation layout (no atomics);
  *   a workgroup-shared optimization is a Phase 5 perf item.
  * - Only `PackedSplats` residency is supported here; ExtSplats/Paged are routed
@@ -80,6 +81,12 @@ export class WebGPUSplatRenderer extends THREE.Group {
   private idxB: StorageBufferAttribute | null = null;
   private tileHist: StorageBufferAttribute | null = null;
   private tileBase: StorageBufferAttribute | null = null;
+  // Spherical-harmonics coefficient buffers (present iff the mesh has SH).
+  private sh1Attr: StorageBufferAttribute | null = null;
+  private sh2Attr: StorageBufferAttribute | null = null;
+  private sh3Attr: StorageBufferAttribute | null = null;
+  private numSh = 0;
+  private shMax = new THREE.Vector3(1, 1, 1);
 
   // Ordered list of compute kernels dispatched each frame (project + sort).
   private computeNodes: unknown[] = [];
@@ -90,6 +97,8 @@ export class WebGPUSplatRenderer extends THREE.Group {
   private uProjection: { value: THREE.Matrix4 } | null = null;
   private uProjScale: { value: THREE.Vector2 } | null = null;
   private uRenderSize: { value: THREE.Vector2 } | null = null;
+  private uViewOrigin: { value: THREE.Vector3 } | null = null;
+  private uShMax: { value: THREE.Vector3 } | null = null;
   private uMaxStdDev: { value: number } | null = null;
   private uMinAlpha: { value: number } | null = null;
   private uMaxPixelRadius: { value: number } | null = null;
@@ -98,6 +107,8 @@ export class WebGPUSplatRenderer extends THREE.Group {
   private readonly tmpModelView = new THREE.Matrix4();
   private readonly tmpModelView3 = new THREE.Matrix3();
   private readonly tmpViewInverse = new THREE.Matrix4();
+  private readonly tmpObjInverse = new THREE.Matrix4();
+  private readonly tmpCamPos = new THREE.Vector3();
   private readonly tmpSize = new THREE.Vector2();
 
   maxStdDev = Math.sqrt(8.0);
@@ -174,6 +185,34 @@ export class WebGPUSplatRenderer extends THREE.Group {
     this.tileHist = new StorageBufferAttribute(new Uint32Array(histLen), 1);
     this.tileBase = new StorageBufferAttribute(new Uint32Array(histLen), 1);
 
+    // Spherical harmonics: upload whichever bands the mesh carries (D3).
+    // sh1 = 2 u32/splat (RG32UI), sh2/sh3 = 4 u32/splat (RGBA32UI).
+    const extra = packed.extra as {
+      sh1?: Uint32Array;
+      sh2?: Uint32Array;
+      sh3?: Uint32Array;
+    };
+    const enc = packed.splatEncoding ?? {};
+    this.shMax.set(enc.sh1Max ?? 1, enc.sh2Max ?? 1, enc.sh3Max ?? 1);
+    const shBuf = (src: Uint32Array, itemSize: number) =>
+      new StorageBufferAttribute(
+        src.subarray(0, numSplats * itemSize).slice() as unknown as Uint32Array,
+        itemSize,
+      );
+    this.numSh = 0;
+    if (extra.sh1 && extra.sh1.length >= numSplats * 2) {
+      this.sh1Attr = shBuf(extra.sh1, 2);
+      this.numSh = 1;
+      if (extra.sh2 && extra.sh2.length >= numSplats * 4) {
+        this.sh2Attr = shBuf(extra.sh2, 4);
+        this.numSh = 2;
+        if (extra.sh3 && extra.sh3.length >= numSplats * 4) {
+          this.sh3Attr = shBuf(extra.sh3, 4);
+          this.numSh = 3;
+        }
+      }
+    }
+
     this.buildPipeline(numTiles);
     const material = this.buildMaterial(MeshBasicNodeMaterial);
 
@@ -192,6 +231,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
       Loop,
       instanceIndex,
       vec2,
+      vec3,
       vec4,
       float,
       uint,
@@ -230,6 +270,8 @@ export class WebGPUSplatRenderer extends THREE.Group {
     const uProjection = uniform(new THREE.Matrix4());
     const uProjScale = uniform(new THREE.Vector2(1, 1));
     const uRenderSize = uniform(new THREE.Vector2(1, 1));
+    const uViewOrigin = uniform(new THREE.Vector3());
+    const uShMax = uniform(new THREE.Vector3(1, 1, 1));
     const uMaxStdDev = uniform(this.maxStdDev);
     const uMinAlpha = uniform(this.minAlpha);
     const uMaxPixelRadius = uniform(this.maxPixelRadius);
@@ -238,9 +280,25 @@ export class WebGPUSplatRenderer extends THREE.Group {
     this.uProjection = uProjection as unknown as { value: THREE.Matrix4 };
     this.uProjScale = uProjScale as unknown as { value: THREE.Vector2 };
     this.uRenderSize = uRenderSize as unknown as { value: THREE.Vector2 };
+    this.uViewOrigin = uViewOrigin as unknown as { value: THREE.Vector3 };
+    this.uShMax = uShMax as unknown as { value: THREE.Vector3 };
     this.uMaxStdDev = uMaxStdDev as unknown as { value: number };
     this.uMinAlpha = uMinAlpha as unknown as { value: number };
     this.uMaxPixelRadius = uMaxPixelRadius as unknown as { value: number };
+
+    // SH evaluation kernels + storage stores (only the bands the mesh has).
+    const sh1Eval = this.numSh >= 1 ? wgslFn(WGSL_EVAL_SH1) : null;
+    const sh2Eval = this.numSh >= 2 ? wgslFn(WGSL_EVAL_SH2) : null;
+    const sh3Eval = this.numSh >= 3 ? wgslFn(WGSL_EVAL_SH3) : null;
+    const sh1S = this.sh1Attr
+      ? storage(this.sh1Attr, "uvec2", N).toReadOnly()
+      : null;
+    const sh2S = this.sh2Attr
+      ? storage(this.sh2Attr, "uvec4", N).toReadOnly()
+      : null;
+    const sh3S = this.sh3Attr
+      ? storage(this.sh3Attr, "uvec4", N).toReadOnly()
+      : null;
 
     // --- Pass A: project (full anisotropic covariance) + depth key + payload ---
     // Port of the standard-splat path in src/shaders/splatVertex.glsl: build the
@@ -317,6 +375,20 @@ export class WebGPUSplatRenderer extends THREE.Group {
           const axis1 = eigenVec1.mul(scale1).mul(twoOverRS);
           const axis2 = eigenVec2.mul(scale2).mul(twoOverRS);
 
+          // View-dependent color: base (SH DC, baked into rgba) + SH bands 1-3,
+          // evaluated in object space (dir from camera to splat), per D3.
+          const rgb = vec3(rgba.x, rgba.y, rgba.z).toVar();
+          if (sh1Eval && sh1S) {
+            const dir = normalize(center.sub(uViewOrigin)).toVar();
+            rgb.addAssign(sh1Eval(sh1S.element(i), dir, uShMax.x));
+            if (sh2Eval && sh2S) {
+              rgb.addAssign(sh2Eval(sh2S.element(i), dir, uShMax.y));
+            }
+            if (sh3Eval && sh3S) {
+              rgb.addAssign(sh3Eval(sh3S.element(i), dir, uShMax.z));
+            }
+          }
+
           const ndc = clip.xyz.div(clip.w);
           projStore.element(base).assign(vec4(ndc.x, ndc.y, clip.z, clip.w));
           projStore
@@ -324,7 +396,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
             .assign(vec4(axis1.x, axis1.y, axis2.x, axis2.y));
           projStore
             .element(base.add(2))
-            .assign(vec4(rgba.x, rgba.y, rgba.z, alpha));
+            .assign(vec4(rgb.x, rgb.y, rgb.z, alpha));
           projStore.element(base.add(3)).assign(vec4(adj, 1.0, 0.0, 0.0));
           keyAStore.element(i).assign(depthKey(viewC.length()));
         });
@@ -508,6 +580,9 @@ export class WebGPUSplatRenderer extends THREE.Group {
     );
     this.tmpModelView3.setFromMatrix4(this.tmpModelView);
     this.renderer.getDrawingBufferSize(this.tmpSize);
+    // Camera position in the mesh's object space, for object-space SH viewDir.
+    this.tmpObjInverse.copy(this.mesh.matrixWorld).invert();
+    camera.getWorldPosition(this.tmpCamPos).applyMatrix4(this.tmpObjInverse);
 
     const proj = (camera as THREE.PerspectiveCamera).projectionMatrix;
     (this.uModelView as { value: THREE.Matrix4 }).value.copy(this.tmpModelView);
@@ -520,6 +595,8 @@ export class WebGPUSplatRenderer extends THREE.Group {
       proj.elements[5],
     );
     (this.uRenderSize as { value: THREE.Vector2 }).value.copy(this.tmpSize);
+    (this.uViewOrigin as { value: THREE.Vector3 }).value.copy(this.tmpCamPos);
+    (this.uShMax as { value: THREE.Vector3 }).value.copy(this.shMax);
     (this.uMaxStdDev as { value: number }).value = this.maxStdDev;
     (this.uMinAlpha as { value: number }).value = this.minAlpha;
     (this.uMaxPixelRadius as { value: number }).value = this.maxPixelRadius;
@@ -554,6 +631,10 @@ export class WebGPUSplatRenderer extends THREE.Group {
     this.idxB = null;
     this.tileHist = null;
     this.tileBase = null;
+    this.sh1Attr = null;
+    this.sh2Attr = null;
+    this.sh3Attr = null;
+    this.numSh = 0;
   }
 }
 
