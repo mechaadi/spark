@@ -15,6 +15,7 @@ See `docs/webgpu-backend/` for the full design and phase notes.
 | `webgpu-hello/` | Minimal single-SplatMesh render through the WebGPU backend. |
 | `webgpu-compare/` | `webgpu.html` + `webgl.html`: the same splat at an identical fixed pose, one per backend, for A/B parity comparison. |
 | `webgpu-benchmark/` | `webgpu.html` + `webgl.html`: generate `?count=N` synthetic splats and report rolling FPS per backend. |
+| `webgpu-editor/` | Interactive viewer on the compute backend: orbit, drag-and-drop / `?url=` loading, SH toggle, render knobs, FPS. PackedSplats only — the full WebGL2 tool is `editor/`. |
 
 These pages map `three` to the appropriate THREE build per backend (the WebGPU
 build does not ship the classic `WebGLRenderer`, and vice-versa), so each backend
