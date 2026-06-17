@@ -22,6 +22,11 @@ import {
   isVisionPro,
   uploadU32DataTextureRows,
 } from "./utils";
+import {
+  type SparkBackendKind,
+  backendFromUrl,
+  resolveBackend,
+} from "./webgpu/capability";
 
 export interface SparkRendererOptions {
   /**
@@ -332,6 +337,62 @@ export class SparkRenderer extends THREE.Mesh {
   autoUpdate: boolean;
   preUpdate: boolean;
   static sparkOverride?: SparkRenderer;
+
+  /**
+   * Capability-detect WebGPU and construct the matching THREE renderer for the
+   * session. This is the blessed way to pick a backend; it encapsulates the
+   * async `WebGPURenderer.init()` and the automatic WebGL2 fallback.
+   *
+   * - WebGPU available (and not forced off) -> a ready `THREE.WebGPURenderer`
+   *   to be driven by the Spark WebGPU backend (`WebGPUSplatRenderer`).
+   * - otherwise -> a classic `THREE.WebGLRenderer` driven by the existing
+   *   WebGL2 `SparkRenderer` path (unchanged).
+   *
+   * The returned `backend` tells the caller which path to wire up. Existing
+   * `new SparkRenderer({ renderer })` usage is unaffected — this is additive.
+   *
+   * `forceBackend` (or a `?sparkBackend=webgpu|webgl2` URL param) overrides
+   * detection for testing and the Phase 5 validation harness.
+   */
+  static async createRenderer(options?: {
+    canvas?: HTMLCanvasElement;
+    antialias?: boolean;
+    preferWebGPU?: boolean;
+    forceBackend?: SparkBackendKind;
+    /** Extra parameters forwarded to the chosen THREE renderer constructor. */
+    rendererParameters?: Record<string, unknown>;
+  }): Promise<{
+    renderer: THREE.WebGLRenderer | import("three/webgpu").WebGPURenderer;
+    backend: SparkBackendKind;
+  }> {
+    const force =
+      options?.forceBackend ??
+      backendFromUrl() ??
+      (options?.preferWebGPU === false ? ("webgl2" as const) : undefined);
+    const backend = await resolveBackend(force);
+    const antialias = options?.antialias ?? false;
+    const params = {
+      ...(options?.canvas ? { canvas: options.canvas } : {}),
+      antialias,
+      ...(options?.rendererParameters ?? {}),
+    };
+
+    if (backend === "webgpu") {
+      try {
+        const { WebGPURenderer } = await import("three/webgpu");
+        const renderer = new WebGPURenderer(params);
+        await renderer.init();
+        return { renderer, backend: "webgpu" };
+      } catch (error) {
+        console.warn(
+          "Spark: WebGPU renderer init failed, falling back to WebGL2.",
+          error,
+        );
+      }
+    }
+    const renderer = new THREE.WebGLRenderer(params);
+    return { renderer, backend: "webgl2" };
+  }
 
   renderSize = new THREE.Vector2();
   maxStdDev: number;

@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spark • WebGPU Hello World (Phase 2)</title>
+  <style>
+    body { margin: 0; }
+    #info {
+      position: fixed; top: 8px; left: 8px; font: 12px monospace;
+      color: #fff; background: rgba(0,0,0,0.5); padding: 6px 8px; border-radius: 4px;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="info">backend: …</div>
+  <!--
+    The WebGPU backend imports `three/webgpu` and `three/tsl` at runtime, so they
+    must be provided in the import map. `three` is mapped to the WebGPU build,
+    which is a superset that also includes the core THREE classes used here.
+    Append ?sparkBackend=webgl2 to force the WebGL2 fallback path.
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "../js/vendor/three/build/three.webgpu.js",
+        "three/webgpu": "../js/vendor/three/build/three.webgpu.js",
+        "three/tsl": "../js/vendor/three/build/three.tsl.js",
+        "three/addons/": "../js/vendor/three/examples/jsm/",
+        "@sparkjsdev/spark": "../../dist/spark.module.js"
+      }
+    }
+  </script>
+  <script type="module">
+    import * as THREE from "three";
+    import { WebGPURenderer } from "three/webgpu";
+    import { SplatMesh, WebGPUSplatRenderer, isWebGPUAvailable }
+      from "@sparkjsdev/spark";
+    import { getAssetFileURL } from "../js/get-asset-url.js";
+
+    const info = document.getElementById("info");
+
+    // This page is mapped to the WebGPU THREE build, which does not include the
+    // classic WebGLRenderer. The automatic WebGL2 fallback (the other half of
+    // Spark's two-renderer model) is exercised by the standard examples, which
+    // load the classic THREE build. Here we require WebGPU and report if absent.
+    if (!isWebGPUAvailable()) {
+      info.textContent =
+        "WebGPU not available in this browser. The WebGL2 path is shown by the " +
+        "other Spark examples (classic THREE build).";
+      throw new Error("WebGPU unavailable");
+    }
+
+    const renderer = new WebGPURenderer({ antialias: false });
+    await renderer.init();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+    info.textContent = "backend: webgpu";
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(
+      60, window.innerWidth / window.innerHeight, 0.1, 1000);
+
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    const splatURL = await getAssetFileURL("butterfly.spz");
+    const butterfly = new SplatMesh({ url: splatURL });
+    await butterfly.initialized;
+
+    const spark = new WebGPUSplatRenderer({ renderer });
+    await spark.init();
+    scene.add(spark);
+    spark.position.set(0, 0, -3);
+    spark.setSplatMesh(butterfly);
+
+    renderer.setAnimationLoop(async () => {
+      spark.rotation.y += 0.01;
+      await spark.renderFrame(scene, camera);
+    });
+  </script>
+</body>
+
+</html>

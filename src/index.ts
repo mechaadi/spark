@@ -2,6 +2,21 @@ export {
   SparkRenderer,
   type SparkRendererOptions,
 } from "./SparkRenderer";
+
+// WebGPU backend (experimental, Phase 2). The renderer class is loaded here as
+// a normal export, but it dynamically imports `three/webgpu` / `three/tsl` only
+// when constructed/initialized, so WebGL-only consumers are unaffected.
+export {
+  WebGPUSplatRenderer,
+  type WebGPUSplatRendererOptions,
+} from "./webgpu/WebGPUSplatRenderer";
+export {
+  type SparkBackendKind,
+  isWebGPUAvailable,
+  canRequestWebGPUAdapter,
+  resolveBackend,
+  backendFromUrl,
+} from "./webgpu/capability";
 export { SplatAccumulator, type GeneratorMapping } from "./SplatAccumulator";
 
 export * as dyno from "./dyno";

@@ -99,7 +99,11 @@ export default defineConfig(({ mode }) => {
       },
       sourcemap: true,
       rollupOptions: {
-        external: ["three", /^three\/addons/],
+        // `three/webgpu` and `three/tsl` are externalized: the WebGPU backend
+        // dynamically imports them at runtime so WebGL-only consumers never load
+        // them. The consumer's import map / bundler must provide them when the
+        // WebGPU path is used.
+        external: ["three", /^three\/addons/, "three/webgpu", "three/tsl"],
         output: {
           globals: {
             three: "THREE",
@@ -129,7 +133,7 @@ export default defineConfig(({ mode }) => {
 
     optimizeDeps: {
       force: true,
-      exclude: ["three"], // prevent Vite pre-bundling
+      exclude: ["three", "three/webgpu", "three/tsl"], // prevent Vite pre-bundling
     },
 
     define: {
