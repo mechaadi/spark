@@ -20,6 +20,9 @@ const TILE = 256; // elements per tile
 const RADIX_BITS = 8;
 const RADIX = 1 << RADIX_BITS; // 256 buckets
 const RADIX_PASSES = 32 / RADIX_BITS; // 4 passes over a 32-bit key
+// Blocks for the 2-level parallel prefix sum over the per-tile histogram, so the
+// scan is O(histLen / SCAN_BLOCKS) parallel work instead of O(histLen) serial.
+const SCAN_BLOCKS = 1024;
 
 // `three/tsl` and `three/webgpu` are loaded via dynamic import (see `load()`),
 // never as static imports, so the default WebGL build does not force WebGL-only
@@ -45,8 +48,9 @@ export interface WebGPUSplatRendererOptions {
  * same frame — no GPU->CPU readback, no worker round-trip, no sort lag.
  *
  * Scope/caveats (documented, replaced in later phases):
- * - The radix sort uses a simple one-tile-per-invocation layout (no atomics);
- *   a workgroup-shared optimization is a Phase 5 perf item.
+ * - The radix sort uses a one-tile-per-invocation count/scatter with a 2-level
+ *   parallel prefix-sum scan (no atomics). A workgroup-shared layout could
+ *   reduce the size-1 dispatch overhead further.
  * - Only `PackedSplats` residency is supported here; ExtSplats/Paged are routed
  *   to the WebGL session per the design (directives D4/D5/D6).
  *
@@ -81,6 +85,8 @@ export class WebGPUSplatRenderer extends THREE.Group {
   private idxB: StorageBufferAttribute | null = null;
   private tileHist: StorageBufferAttribute | null = null;
   private tileBase: StorageBufferAttribute | null = null;
+  private blockSum: StorageBufferAttribute | null = null;
+  private blockBase: StorageBufferAttribute | null = null;
   // Spherical-harmonics coefficient buffers (present iff the mesh has SH).
   private sh1Attr: StorageBufferAttribute | null = null;
   private sh2Attr: StorageBufferAttribute | null = null;
@@ -184,6 +190,11 @@ export class WebGPUSplatRenderer extends THREE.Group {
     this.idxB = new StorageBufferAttribute(new Uint32Array(numSplats), 1);
     this.tileHist = new StorageBufferAttribute(new Uint32Array(histLen), 1);
     this.tileBase = new StorageBufferAttribute(new Uint32Array(histLen), 1);
+    this.blockSum = new StorageBufferAttribute(new Uint32Array(SCAN_BLOCKS), 1);
+    this.blockBase = new StorageBufferAttribute(
+      new Uint32Array(SCAN_BLOCKS),
+      1,
+    );
 
     // Spherical harmonics: upload whichever bands the mesh carries (D3).
     // sh1 = 2 u32/splat (RG32UI), sh2/sh3 = 4 u32/splat (RGBA32UI).
@@ -264,6 +275,10 @@ export class WebGPUSplatRenderer extends THREE.Group {
     const idxBStore = storage(sba(this.idxB), "uint", N);
     const histStore = storage(sba(this.tileHist), "uint", histLen);
     const baseStore = storage(sba(this.tileBase), "uint", histLen);
+    const blockSumStore = storage(sba(this.blockSum), "uint", SCAN_BLOCKS);
+    const blockBaseStore = storage(sba(this.blockBase), "uint", SCAN_BLOCKS);
+    // Per-block span of the digit-major histogram for the 2-level scan.
+    const scanBlockSize = Math.ceil(histLen / SCAN_BLOCKS);
 
     const uModelView = uniform(new THREE.Matrix4());
     const uModelView3 = uniform(new THREE.Matrix3());
@@ -431,13 +446,42 @@ export class WebGPUSplatRenderer extends THREE.Group {
         });
       });
 
-    // Single-invocation exclusive prefix sum over the digit-major histogram.
-    const scanKernel = () =>
+    // Exclusive prefix sum over the digit-major histogram, as a 2-level scan:
+    // (1) each block sums its span, (2) one invocation scans the block sums,
+    // (3) each block scans its span seeded with its block base. This makes the
+    // scan parallel across SCAN_BLOCKS instead of a single serial pass.
+    const scanReduceKernel = () =>
+      Fn(() => {
+        const b = instanceIndex;
+        const start = b.mul(scanBlockSize);
+        const sum = uint(0).toVar();
+        Loop(scanBlockSize, ({ i }) => {
+          const e = start.add(i);
+          If(e.lessThan(histLen), () => {
+            sum.assign(sum.add(histStore.element(e)));
+          });
+        });
+        blockSumStore.element(b).assign(sum);
+      });
+    const scanBlockBaseKernel = () =>
       Fn(() => {
         const running = uint(0).toVar();
-        Loop(histLen, ({ i }) => {
-          baseStore.element(i).assign(running);
-          running.assign(running.add(histStore.element(i)));
+        Loop(SCAN_BLOCKS, ({ i }) => {
+          blockBaseStore.element(uint(i)).assign(running);
+          running.assign(running.add(blockSumStore.element(uint(i))));
+        });
+      });
+    const scanDownKernel = () =>
+      Fn(() => {
+        const b = instanceIndex;
+        const start = b.mul(scanBlockSize);
+        const running = blockBaseStore.element(b).toVar();
+        Loop(scanBlockSize, ({ i }) => {
+          const e = start.add(i);
+          If(e.lessThan(histLen), () => {
+            baseStore.element(e).assign(running);
+            running.assign(running.add(histStore.element(e)));
+          });
         });
       });
 
@@ -479,7 +523,9 @@ export class WebGPUSplatRenderer extends THREE.Group {
     for (let p = 0; p < RADIX_PASSES; p++) {
       const shift = p * RADIX_BITS;
       nodes.push(countKernel(inKey, shift)().compute(numTiles));
-      nodes.push(scanKernel()().compute(1));
+      nodes.push(scanReduceKernel()().compute(SCAN_BLOCKS));
+      nodes.push(scanBlockBaseKernel()().compute(1));
+      nodes.push(scanDownKernel()().compute(SCAN_BLOCKS));
       nodes.push(
         scatterKernel(inKey, inIdx, outKey, outIdx, shift)().compute(numTiles),
       );
@@ -635,6 +681,8 @@ export class WebGPUSplatRenderer extends THREE.Group {
     this.idxB = null;
     this.tileHist = null;
     this.tileBase = null;
+    this.blockSum = null;
+    this.blockBase = null;
     this.sh1Attr = null;
     this.sh2Attr = null;
     this.sh3Attr = null;

@@ -9,6 +9,7 @@ import assert from "node:assert";
 const TILE = 256;
 const RADIX = 256;
 const PASSES = 4;
+const SCAN_BLOCKS = 1024;
 
 function radixSortTiled(input: Uint32Array): {
   keys: Uint32Array;
@@ -42,11 +43,33 @@ function radixSortTiled(input: Uint32Array): {
       for (let d = 0; d < RADIX; d++) hist[d * numTiles + t] = local[d];
     }
 
-    // scan: single exclusive prefix sum over the whole digit-major histogram
-    let running = 0;
-    for (let m = 0; m < histLen; m++) {
-      base[m] = running >>> 0;
-      running = (running + hist[m]) >>> 0;
+    // scan: 2-level block exclusive prefix sum (mirrors the GPU scan kernels:
+    // reduce per block -> scan block sums -> scan each block seeded with base).
+    const blockSize = Math.ceil(histLen / SCAN_BLOCKS);
+    const blockSum = new Uint32Array(SCAN_BLOCKS);
+    const blockBase = new Uint32Array(SCAN_BLOCKS);
+    for (let b = 0; b < SCAN_BLOCKS; b++) {
+      let sum = 0;
+      for (let k = 0; k < blockSize; k++) {
+        const e = b * blockSize + k;
+        if (e < histLen) sum = (sum + hist[e]) >>> 0;
+      }
+      blockSum[b] = sum;
+    }
+    let acc = 0;
+    for (let b = 0; b < SCAN_BLOCKS; b++) {
+      blockBase[b] = acc >>> 0;
+      acc = (acc + blockSum[b]) >>> 0;
+    }
+    for (let b = 0; b < SCAN_BLOCKS; b++) {
+      let running = blockBase[b];
+      for (let k = 0; k < blockSize; k++) {
+        const e = b * blockSize + k;
+        if (e < histLen) {
+          base[e] = running >>> 0;
+          running = (running + hist[e]) >>> 0;
+        }
+      }
     }
 
     // scatter: stable, each tile emits to its running global offset per digit

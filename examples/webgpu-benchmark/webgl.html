@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spark • Benchmark (WebGL2)</title>
+  <style>
+    body { margin: 0; background: #000; }
+    #info { position: fixed; top: 8px; left: 8px; font: 13px monospace;
+      color: #0f0; background: rgba(0,0,0,0.6); padding: 6px 8px; border-radius: 4px; white-space: pre; }
+  </style>
+</head>
+<body>
+  <div id="info">WebGL2 — loading…</div>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "../js/vendor/three/build/three.module.js",
+        "three/addons/": "../js/vendor/three/examples/jsm/",
+        "@sparkjsdev/spark": "../../dist/spark.module.js"
+      }
+    }
+  </script>
+  <script type="module">
+    import * as THREE from "three";
+    import { SplatMesh, PackedSplats, SparkRenderer } from "@sparkjsdev/spark";
+    import { generatePackedSplats, makeFpsMeter } from "./gen.js";
+
+    const count = Number(new URLSearchParams(location.search).get("count") || 1_000_000);
+    const info = document.getElementById("info");
+
+    const renderer = new THREE.WebGLRenderer({ antialias: false });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+
+    const spark = new SparkRenderer({ renderer });
+    scene.add(spark);
+
+    const packedArray = generatePackedSplats(count);
+    const packedSplats = new PackedSplats({ packedArray, numSplats: count });
+    const mesh = new SplatMesh({ packedSplats });
+    await mesh.initialized;
+    mesh.position.set(0, 0, -5);
+    scene.add(mesh);
+
+    const fps = makeFpsMeter();
+    window.__bench = { backend: "webgl2", count, fps: 0 };
+    renderer.setAnimationLoop((t) => {
+      mesh.rotation.y += 0.003;
+      renderer.render(scene, camera);
+      const f = fps.tick(t);
+      window.__bench.fps = f;
+      info.textContent = `WebGL2\nsplats: ${count.toLocaleString()}\nfps: ${f}`;
+    });
+  </script>
+</body>
+</html>
