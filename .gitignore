@@ -8,3 +8,6 @@ site/
 site-repo/
 *.zip
 *.gltf
+
+# Generated static deploy of all examples (scripts/build-examples-site.js)
+examples-site/
