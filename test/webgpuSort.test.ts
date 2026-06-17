@@ -1,31 +1,72 @@
 import assert from "node:assert";
 
-// CPU mirror of the single-pass GPU counting sort in
-// src/webgpu/WebGPUSplatRenderer.ts (buildPipeline): histogram -> exclusive
-// prefix sum -> scatter by the bucket offset. Validates the algorithm the
-// count/scan/scatter compute kernels implement.
+// CPU mirror of the stable tiled radix sort in
+// src/webgpu/WebGPUSplatRenderer.ts (buildPipeline): per-tile digit-major
+// histogram -> exclusive prefix sum -> stable scatter, ping-pong over
+// RADIX_PASSES passes of RADIX_BITS each. Validates the algorithm the
+// count/scan/scatter compute kernels implement, including STABILITY (the draw
+// order of equal-depth splats must be deterministic, or alpha blending of
+// overlapping splats flickers frame to frame).
 
-function countingSort(
-  keys: Uint32Array,
-  buckets: number,
-): { order: Uint32Array } {
-  const n = keys.length;
-  const hist = new Uint32Array(buckets);
-  for (let i = 0; i < n; i++) hist[keys[i]]++;
-  // exclusive prefix sum -> first write position per bucket
-  const offset = new Uint32Array(buckets);
-  let running = 0;
-  for (let b = 0; b < buckets; b++) {
-    offset[b] = running;
-    running += hist[b];
+const TILE = 256;
+const RADIX = 256;
+const RADIX_BITS = 8;
+const RADIX_PASSES = 2; // 16-bit key
+
+function radixSort(input: Uint32Array): {
+  keys: Uint32Array;
+  order: Uint32Array;
+} {
+  const N = input.length;
+  const numTiles = Math.ceil(N / TILE);
+  const histLen = numTiles * RADIX;
+
+  let inKey = Uint32Array.from(input);
+  let outKey = new Uint32Array(N);
+  let inIdx = new Uint32Array(N);
+  for (let i = 0; i < N; i++) inIdx[i] = i;
+  let outIdx = new Uint32Array(N);
+
+  const hist = new Uint32Array(histLen);
+  const base = new Uint32Array(histLen);
+
+  for (let p = 0; p < RADIX_PASSES; p++) {
+    const shift = p * RADIX_BITS;
+    // count: per-tile histogram, digit-major
+    hist.fill(0);
+    for (let t = 0; t < numTiles; t++) {
+      const local = new Uint32Array(RADIX);
+      for (let j = 0; j < TILE; j++) {
+        const e = t * TILE + j;
+        if (e < N) local[(inKey[e] >>> shift) & (RADIX - 1)]++;
+      }
+      for (let d = 0; d < RADIX; d++) hist[d * numTiles + t] = local[d];
+    }
+    // exclusive prefix sum
+    let running = 0;
+    for (let m = 0; m < histLen; m++) {
+      base[m] = running >>> 0;
+      running = (running + hist[m]) >>> 0;
+    }
+    // stable scatter (each tile emits in element order)
+    for (let t = 0; t < numTiles; t++) {
+      const offset = new Uint32Array(RADIX);
+      for (let d = 0; d < RADIX; d++) offset[d] = base[d * numTiles + t];
+      for (let j = 0; j < TILE; j++) {
+        const e = t * TILE + j;
+        if (e < N) {
+          const key = inKey[e];
+          const d = (key >>> shift) & (RADIX - 1);
+          const pos = offset[d]++;
+          outKey[pos] = key;
+          outIdx[pos] = inIdx[e];
+        }
+      }
+    }
+    [inKey, outKey] = [outKey, inKey];
+    [inIdx, outIdx] = [outIdx, inIdx];
   }
-  // scatter
-  const order = new Uint32Array(n);
-  for (let i = 0; i < n; i++) {
-    const b = keys[i];
-    order[offset[b]++] = i;
-  }
-  return { order };
+  return { keys: inKey, order: inIdx };
 }
 
 function makeRng(seed: number): () => number {
@@ -36,61 +77,70 @@ function makeRng(seed: number): () => number {
   };
 }
 
-function check(keys: Uint32Array, buckets: number, label: string): void {
-  const { order } = countingSort(keys, buckets);
-  const n = keys.length;
-  // permutation of [0, n)
-  const seen = new Uint8Array(n);
-  for (let i = 0; i < n; i++) {
-    assert.ok(order[i] < n, `${label}: order out of range`);
+function check(input: Uint32Array, label: string): void {
+  const { keys, order } = radixSort(input);
+  const N = input.length;
+  // permutation + ascending + key/order consistency
+  const seen = new Uint8Array(N);
+  for (let i = 0; i < N; i++) {
+    assert.ok(order[i] < N, `${label}: order out of range`);
     assert.ok(!seen[order[i]], `${label}: duplicate in order`);
     seen[order[i]] = 1;
-  }
-  // keys are non-decreasing along the sorted order (correct ascending sort)
-  for (let i = 1; i < n; i++) {
-    assert.ok(
-      keys[order[i]] >= keys[order[i - 1]],
-      `${label}: not sorted ascending at ${i}`,
+    assert.strictEqual(
+      keys[i],
+      input[order[i]],
+      `${label}: key/order mismatch`,
     );
+    if (i > 0) {
+      assert.ok(keys[i] >= keys[i - 1], `${label}: not ascending at ${i}`);
+    }
+  }
+  // STABILITY: equal keys keep original index order
+  const ref = Array.from({ length: N }, (_, i) => i).sort(
+    (a, b) => input[a] - input[b] || a - b,
+  );
+  for (let i = 0; i < N; i++) {
+    assert.strictEqual(order[i], ref[i], `${label}: not a stable sort at ${i}`);
   }
 }
 
-for (const n of [1, 255, 256, 257, 1000, 5000]) {
-  const rng = makeRng(n + 1);
-  const a = new Uint32Array(n);
-  for (let i = 0; i < n; i++) a[i] = rng() % 256;
-  check(a, 256, `random n=${n}`);
+for (const N of [1, 255, 256, 257, 1000, 5000]) {
+  const rng = makeRng(N + 1);
+  const a = new Uint32Array(N);
+  for (let i = 0; i < N; i++) a[i] = rng() & 0xffff; // 16-bit keys
+  check(a, `random n=${N}`);
 }
-// heavy ties + degenerate
-check(new Uint32Array(4096).fill(7), 256, "all-equal");
-check(
-  Uint32Array.from({ length: 1000 }, (_, i) => i % 256),
-  256,
-  "sorted-mod",
-);
+// heavy ties stress stability
 {
-  // sentinel bucket (BUCKETS-1) must sort to the very end
+  const N = 4096;
+  const rng = makeRng(7);
+  const a = new Uint32Array(N);
+  for (let i = 0; i < N; i++) a[i] = rng() % 16;
+  check(a, "many-ties");
+}
+check(new Uint32Array(2048).fill(42), "all-equal");
+// inactive sentinel (0xffff) sorts to the end
+{
   const N = 1000;
-  const B = 256;
   const rng = makeRng(99);
   const a = new Uint32Array(N);
   let sentinels = 0;
   for (let i = 0; i < N; i++) {
     if (rng() % 4 === 0) {
-      a[i] = B - 1;
+      a[i] = 0xffff;
       sentinels++;
     } else {
-      a[i] = rng() % (B - 1);
+      a[i] = rng() % 0xffff;
     }
   }
-  const { order } = countingSort(a, B);
+  const { keys } = radixSort(a);
   for (let i = 0; i < sentinels; i++) {
-    assert.strictEqual(a[order[N - 1 - i]], B - 1, "sentinels not at the end");
+    assert.strictEqual(keys[N - 1 - i], 0xffff, "sentinels not at the end");
   }
 }
 
 // 16-bit depth key (mirror of WGSL: depthKey(d) >> 16). Larger depth -> smaller
-// key, so the ascending counting sort draws far -> near.
+// key, so the ascending sort draws far -> near.
 function depthKey16(depth: number): number {
   const u = new Uint32Array(new Float32Array([depth]).buffer)[0];
   const mask = u & 0x80000000 ? 0xffffffff : 0x80000000;
@@ -104,7 +154,6 @@ function depthKey16(depth: number): number {
       `depthKey16 not non-increasing with depth at ${depths[i]}`,
     );
   }
-  // active keys must stay below the inactive sentinel (0xffff)
   for (const d of depths) {
     assert.ok(depthKey16(d) < 0xffff, "active key collides with sentinel");
   }
