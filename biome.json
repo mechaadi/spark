@@ -19,7 +19,8 @@
       "*.backup*",
       "examples/**/spark.module.js",
       "examples/**/*.json",
-      "examples/**/pkg"
+      "examples/**/pkg",
+      "webgpu-editor-site/spark.module.js"
     ]
   },
   "formatter": {

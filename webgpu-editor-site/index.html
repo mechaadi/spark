@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spark • Editor (WebGPU)</title>
+  <style>
+    body { margin: 0; background: #000; overflow: hidden; }
+    #canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      outline: none;
+      touch-action: none;
+    }
+    #gui { position: absolute; top: 5px; right: 5px; }
+    #badge {
+      position: absolute;
+      top: 8px;
+      left: 8px;
+      font: 12px/1.4 monospace;
+      color: #fff;
+      background: rgba(0, 0, 0, 0.5);
+      padding: 6px 8px;
+      border-radius: 4px;
+      pointer-events: none;
+      white-space: pre;
+    }
+    #unsupported {
+      position: absolute;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      color: #fff;
+      font: 15px/1.6 system-ui, sans-serif;
+      text-align: center;
+      padding: 24px;
+    }
+    #unsupported a { color: #6cf; }
+    #drop-hint {
+      position: absolute;
+      inset: 0;
+      border: 3px dashed transparent;
+      box-sizing: border-box;
+      pointer-events: none;
+      transition: border-color 0.15s ease;
+    }
+    #drop-hint.active { border-color: #4CAF50; }
+  </style>
+</head>
+
+<body>
+  <canvas id="canvas" tabindex="0"></canvas>
+  <div id="drop-hint"></div>
+  <div id="badge">WebGPU</div>
+  <div id="gui"></div>
+  <div id="unsupported">
+    <div>
+      <p><strong>WebGPU isn't available in this browser.</strong></p>
+      <p>The WebGPU compute backend needs a WebGPU-capable browser/GPU.<br>
+      Try the WebGL2 <a href="../editor/">editor</a> instead — it's the default path and works everywhere.</p>
+    </div>
+  </div>
+
+  <input id="file-input" type="file"
+    accept=".ply,.spz,.splat,.ksplat,.zip,.sog,.rad" style="display:none" />
+
+  <!-- three / lil-gui / stats from a CDN, pinned to the versions Spark is built
+       against; only the Spark bundle is hosted locally (./spark.module.js). -->
+  <script src="https://cdn.jsdelivr.net/npm/stats.js@0.17.0/build/stats.min.js"></script>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.webgpu.js",
+        "three/webgpu": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.webgpu.js",
+        "three/tsl": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.tsl.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
+        "@sparkjsdev/spark": "./spark.module.js",
+        "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.20.0/dist/lil-gui.esm.js"
+      }
+    }
+  </script>
+  <script type="module">
+    import * as THREE from "three";
+    import { WebGPURenderer } from "three/webgpu";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+    import { GUI } from "lil-gui";
+    import {
+      SplatMesh,
+      SparkControls,
+      WebGPUSplatRenderer,
+      isWebGPUAvailable,
+      requestWebGPUStorageLimits,
+    } from "@sparkjsdev/spark";
+
+    // Default demo asset (served from sparkjs.dev). Override with ?url=<splat>.
+    const DEFAULT_SPLAT = "https://sparkjs.dev/assets/splats/butterfly.spz";
+
+    const canvas = document.getElementById("canvas");
+    const badge = document.getElementById("badge");
+
+    // The WebGPU editor only runs on the compute backend; there is no WebGL2
+    // fallback *on this page* (that's what ../editor/ is). Detect up front so we
+    // show a helpful message instead of a black screen.
+    if (!isWebGPUAvailable()) {
+      document.getElementById("unsupported").style.display = "flex";
+      document.getElementById("gui").style.display = "none";
+      badge.style.display = "none";
+      throw new Error("WebGPU unavailable");
+    }
+
+    // --- Renderer / scene -------------------------------------------------
+    // Raise the storage-buffer limits to the adapter maxima so large splat sets
+    // (the per-splat projection buffer is 64 B/splat, past the 128 MiB default
+    // binding size around ~2M splats) bind without error.
+    const requiredLimits = (await requestWebGPUStorageLimits()) ?? {};
+    const renderer = new WebGPURenderer({ canvas, antialias: false, requiredLimits });
+    await renderer.init();
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color("#000000");
+    const camera = new THREE.PerspectiveCamera(
+      60, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 0, 3);
+
+    const spark = new WebGPUSplatRenderer({ renderer, enableSh: true });
+    await spark.init();
+    scene.add(spark);
+
+    // Two camera control schemes, toggled in the GUI: OrbitControls (orbit a
+    // target) and Spark's pointer/fly controls (SparkControls, which exposes the
+    // reverse-pointer options). Only one drives the camera per frame.
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0, 0);
+    controls.enableDamping = true;
+    controls.minDistance = 0.2;
+    controls.maxDistance = 50;
+
+    const sparkControls = new SparkControls({ canvas });
+
+    // Base orientation applied to the splat so files authored in different
+    // conventions (Y-up OpenGL, Y-down OpenCV, Z-up) sit upright. Spark's group
+    // is at the origin, so its quaternion is the model's world orientation.
+    const COORD_QUATS = {
+      OpenGL: new THREE.Quaternion(0, 0, 0, 1),
+      OpenCV: new THREE.Quaternion(1, 0, 0, 0),
+      "Z-up": new THREE.Quaternion(-1, 0, 0, 1).normalize(),
+    };
+
+    // Reference ground grid (a plain THREE line grid, rendered alongside the
+    // splats by the WebGPU renderer). Hidden until opacity > 0.
+    const grid = new THREE.GridHelper(10, 10, 0x666666, 0x333333);
+    grid.material.transparent = true;
+    grid.material.opacity = 0;
+    grid.visible = false;
+    scene.add(grid);
+
+    // Point the orbit target at the loaded model's (oriented) center.
+    function recenterTarget() {
+      if (!currentMesh) return;
+      const center = currentMesh.getBoundingBox(true).getCenter(new THREE.Vector3());
+      controls.target.copy(center.applyQuaternion(spark.quaternion));
+      controls.update();
+    }
+
+    function applyCoordSystem() {
+      spark.quaternion.copy(COORD_QUATS[guiOptions.coordSystem]);
+      recenterTarget();
+    }
+
+    const stats = new Stats();
+    document.body.appendChild(stats.dom);
+    stats.dom.style.display = "none";
+
+    let highDpi = true;
+    function handleResize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      renderer.setPixelRatio(highDpi ? window.devicePixelRatio : 1);
+      renderer.setSize(w, h, false);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+    handleResize();
+    window.addEventListener("resize", handleResize);
+
+    // --- Splat loading (single mesh; WebGPU backend is one-mesh) ----------
+    // The compute backend renders PackedSplats only, so we load plain
+    // SplatMeshes (no extSplats / no LOD) and hand them to setSplatMesh, which
+    // replaces whatever was loaded before. ExtSplats/Paged/dyno scenes belong
+    // on the WebGL2 ../editor/ page (directives D4/D5/D6).
+    let currentMesh = null;
+    let modelRadius = 1; // half-diagonal of the loaded model, for size-based culling
+
+    // Cull big "floater" splats: threshold is a fraction of the model size, so it
+    // ports across scenes. 1 keeps everything; lower trims diffuse background blobs.
+    function applyTrimFloaters() {
+      spark.maxSplatScale =
+        guiOptions.trimFloaters >= 1 ? Infinity : guiOptions.trimFloaters * modelRadius;
+    }
+
+    // Render presets, auto-applied on every load. "PlayCanvas-like" reproduces how
+    // PlayCanvas/SuperSplat render captures cleanly — without changing the
+    // renderer's WebGL-matching defaults — by stacking a tighter Gaussian cutoff
+    // (≈2σ), a higher alpha discard, an on-screen size clamp, and an object-space
+    // floater cull. "Spark default" restores the WebGL-parity look.
+    const RENDER_PRESETS = {
+      "PlayCanvas-like": { maxStdDev: 2.5, minAlpha: 0.1, maxPixelRadius: 58, trimFloaters: 0.2 },
+      "Spark default": { maxStdDev: Math.sqrt(8), minAlpha: 0.5 / 255, maxPixelRadius: 512, trimFloaters: 1 },
+    };
+    function applyRenderPreset(name) {
+      const p = RENDER_PRESETS[name];
+      if (!p) return;
+      spark.maxStdDev = p.maxStdDev;
+      spark.minAlpha = p.minAlpha;
+      spark.maxPixelRadius = p.maxPixelRadius;
+      guiOptions.trimFloaters = p.trimFloaters;
+      applyTrimFloaters();
+    }
+
+    async function loadSource(src) {
+      const init = typeof src === "string" ? { url: src } : { fileBytes: src.bytes, fileName: src.name };
+      let mesh;
+      try {
+        mesh = new SplatMesh(init);
+        await mesh.initialized;
+      } catch (err) {
+        console.error("Failed to load splat:", err);
+        alert(`Could not load splat:\n${err.message ?? err}`);
+        return;
+      }
+
+      currentMesh = mesh;
+      // enableSh is read by setSplatMesh, so apply the current toggle first.
+      spark.enableSh = guiOptions.enableSh;
+      spark.setSplatMesh(mesh);
+
+      const n = mesh.packedSplats?.numSplats ?? 0;
+      guiOptions.splatCount = n.toLocaleString();
+      guiOptions.source = typeof src === "string"
+        ? src.split("/").pop().split("?")[0]
+        : src.name;
+      updateBadge();
+      modelRadius =
+        mesh.getBoundingBox(true).getSize(new THREE.Vector3()).length() * 0.5;
+      // Auto-apply the current render preset (default PlayCanvas-like) so every
+      // scene loads clean without manual tuning; the floater cull uses the new
+      // model's size.
+      applyRenderPreset(guiOptions.renderPreset);
+      recenterTarget();
+    }
+
+    async function loadFiles(fileList) {
+      // One mesh at a time — take the first supported file.
+      const file = fileList[0];
+      if (!file) return;
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      await loadSource({ bytes, name: file.name });
+    }
+
+    function updateBadge() {
+      badge.textContent =
+        `WebGPU\n${guiOptions.source}\n${guiOptions.splatCount} splats`;
+    }
+
+    // --- GUI --------------------------------------------------------------
+    const guiOptions = {
+      source: "—",
+      splatCount: "—",
+      enableSh: true,
+      trimFloaters: 0.2,
+      renderPreset: "PlayCanvas-like",
+      coordSystem: "OpenGL",
+      orbit: true,
+      reversePointerDir: false,
+      reversePointerSlide: false,
+      autoRotate: false,
+      highDpi: true,
+      background: "#000000",
+      gridOpacity: 0,
+      showStats: false,
+      openFile: () => fileInput.click(),
+      url: "",
+      loadFromUrl: () => {
+        const u = guiOptions.url.trim();
+        if (!u) return;
+        if (!/^https?:\/\//.test(u)) {
+          alert("Enter an http(s):// URL to a .ply/.spz/.splat/.ksplat/.zip/.sog/.rad file.");
+          return;
+        }
+        loadSource(u);
+      },
+      resetPose: () => {
+        camera.position.set(0, 0, 3);
+        camera.fov = 60;
+        camera.updateProjectionMatrix();
+        recenterTarget();
+      },
+    };
+
+    const gui = new GUI({ title: "WebGPU Editor", container: document.getElementById("gui") });
+
+    // --- Scene (loading) ---
+    const fileFolder = gui.addFolder("Scene");
+    fileFolder.add(guiOptions, "openFile").name("Open file…");
+    fileFolder.add(guiOptions, "url").name("URL");
+    fileFolder.add(guiOptions, "loadFromUrl").name("Load from URL");
+    fileFolder.add(guiOptions, "source").name("Loaded").listen().disable();
+    fileFolder.add(guiOptions, "splatCount").name("Splats").listen().disable();
+
+    // --- Camera ---
+    const cameraFolder = gui.addFolder("Camera");
+    const poseFolder = cameraFolder.addFolder("Camera Pose");
+    poseFolder.add(guiOptions, "resetPose").name("Reset pose");
+    // X/Y/Z are a live readout (OrbitControls owns the position each frame, so
+    // editing them would just snap back). FOV is independent of orbit, so it's
+    // editable.
+    poseFolder.add(camera.position, "x", -20, 20, 0.01).name("X").listen().disable();
+    poseFolder.add(camera.position, "y", -20, 20, 0.01).name("Y").listen().disable();
+    poseFolder.add(camera.position, "z", -20, 20, 0.01).name("Z").listen().disable();
+    poseFolder.add(camera, "fov", 1, 179, 1).name("Fov Y degrees").listen()
+      .onChange(() => camera.updateProjectionMatrix());
+    cameraFolder.add(guiOptions, "coordSystem", ["OpenGL", "OpenCV", "Z-up"])
+      .name("Coordinate system").onChange(applyCoordSystem);
+    cameraFolder.add(guiOptions, "autoRotate").name("Auto rotate").onChange((v) => {
+      controls.autoRotate = v;
+    });
+    cameraFolder.add(guiOptions, "orbit").name("Orbit controls").onChange((v) => {
+      controls.enabled = v;
+      canvas.focus();
+    });
+    cameraFolder.add(guiOptions, "reversePointerDir").name("Reverse ptr direction")
+      .onChange((v) => {
+        sparkControls.pointerControls.reverseRotate = v;
+        sparkControls.pointerControls.reverseScroll = v;
+      });
+    cameraFolder.add(guiOptions, "reversePointerSlide").name("Reverse ptr slide")
+      .onChange((v) => {
+        sparkControls.pointerControls.reverseSlide = v;
+        sparkControls.pointerControls.reverseSwipe = v;
+      });
+
+    // --- View ---
+    const viewFolder = gui.addFolder("View");
+    viewFolder.add(guiOptions, "highDpi").name("High DPI").onChange((v) => {
+      highDpi = v;
+      handleResize();
+    });
+    viewFolder.add(guiOptions, "showStats").name("Show frame stats").onChange((v) => {
+      stats.dom.style.display = v ? "block" : "none";
+    });
+    viewFolder.add(guiOptions, "gridOpacity", 0, 1, 0.01).name("Grid opacity").onChange((v) => {
+      grid.material.opacity = v;
+      grid.visible = v > 0;
+    });
+    viewFolder.addColor(guiOptions, "background").name("Background color").onChange((v) => {
+      scene.background.set(v);
+    });
+
+    // --- Splat rendering (the knobs WebGPUSplatRenderer actually exposes) ---
+    // NOTE: depth-of-field (focal distance / aperture), level-of-detail, dyno
+    // clip/debug recolor, radial-sort toggle, and ExtSplats encoding are
+    // WebGL2-path features (SparkRenderer + dyno) and intentionally absent here —
+    // the compute backend always radial-sorts PackedSplats. Use ../editor/ for
+    // those (directives D4/D5/D6).
+    const renderFolder = gui.addFolder("Splat rendering");
+    renderFolder.add(guiOptions, "enableSh").name("Spherical harmonics").onChange(() => {
+      // SH buffers are (un)uploaded in setSplatMesh, so re-apply the mesh.
+      if (currentMesh) {
+        spark.enableSh = guiOptions.enableSh;
+        spark.setSplatMesh(currentMesh);
+        recenterTarget();
+      }
+    });
+    renderFolder.add(spark, "maxStdDev", 0.5, 4, 0.01).name("Max Gsplat stddev").listen();
+    renderFolder.add(spark, "minAlpha", 0, 0.1, 0.0005).name("Min alpha").listen();
+    renderFolder.add(spark, "maxPixelRadius", 16, 1024, 1).name("Max pixel radius").listen();
+    // Drag below 1 to cull oversized floater splats (fraction of model size).
+    renderFolder.add(guiOptions, "trimFloaters", 0.002, 1, 0.002)
+      .name("Max splat size").listen().onChange(applyTrimFloaters);
+    // Auto-applied on load (default "PlayCanvas-like"); pick "Spark default" for
+    // the WebGL-parity look. The sliders above reflect the chosen preset.
+    renderFolder.add(guiOptions, "renderPreset", Object.keys(RENDER_PRESETS))
+      .name("Preset").onChange(applyRenderPreset);
+
+    // --- File input + drag/drop ------------------------------------------
+    const fileInput = document.getElementById("file-input");
+    fileInput.onchange = (e) => loadFiles([...e.target.files]);
+
+    const dropHint = document.getElementById("drop-hint");
+    const SUPPORTED = [".ply", ".spz", ".splat", ".ksplat", ".zip", ".sog", ".rad"];
+    canvas.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      dropHint.classList.add("active");
+    });
+    canvas.addEventListener("dragleave", () => dropHint.classList.remove("active"));
+    canvas.addEventListener("drop", (e) => {
+      e.preventDefault();
+      dropHint.classList.remove("active");
+      const files = [...e.dataTransfer.files].filter((f) =>
+        SUPPORTED.some((ext) => f.name.toLowerCase().endsWith(ext)));
+      if (files.length) loadFiles(files);
+    });
+
+    // --- Initial scene ----------------------------------------------------
+    // ?url=<splat> overrides; otherwise show the butterfly demo asset.
+    const urlParam = new URLSearchParams(location.search).get("url");
+    await loadSource(urlParam ?? DEFAULT_SPLAT);
+
+    // --- Render loop ------------------------------------------------------
+    renderer.setAnimationLoop(async () => {
+      stats.begin();
+      if (guiOptions.orbit) {
+        controls.update();
+      } else {
+        sparkControls.update(camera);
+      }
+      await spark.renderFrame(scene, camera);
+      stats.end();
+    });
+  </script>
+</body>
+
+</html>

@@ -1,0 +1,4 @@
+# Build artifact — copied from dist/ at deploy time (see README), not committed.
+spark.module.js
+spark.module.js.map
+.vercel

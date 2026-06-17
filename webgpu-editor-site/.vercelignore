@@ -1,0 +1,4 @@
+# Present so Vercel does NOT fall back to .gitignore when uploading — the local
+# Spark bundle (spark.module.js) is gitignored but MUST be deployed. Nothing here
+# is ignored; everything in this folder is uploaded.
+.vercel
