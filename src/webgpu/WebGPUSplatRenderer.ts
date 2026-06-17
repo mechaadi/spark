@@ -639,7 +639,11 @@ export class WebGPUSplatRenderer extends THREE.Group {
         c.div(12.92),
         c.add(0.055).div(1.055).pow(2.4),
       );
-      return vec4(linear.mul(alpha), alpha);
+      // Output STRAIGHT (non-premultiplied) color: NodeMaterial premultiplies it
+      // itself when `premultipliedAlpha === true`. Outputting premultiplied here
+      // would double-premultiply (rgb*alpha^2), darkening semi-transparent splats
+      // to near nothing and leaving only opaque splats (a sparkle artifact).
+      return vec4(linear, alpha);
     })();
 
     return material;
