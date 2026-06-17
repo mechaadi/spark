@@ -16,6 +16,7 @@ export {
   canRequestWebGPUAdapter,
   resolveBackend,
   backendFromUrl,
+  requestWebGPUStorageLimits,
 } from "./webgpu/capability";
 export { SplatAccumulator, type GeneratorMapping } from "./SplatAccumulator";
 

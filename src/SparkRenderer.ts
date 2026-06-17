@@ -25,6 +25,7 @@ import {
 import {
   type SparkBackendKind,
   backendFromUrl,
+  requestWebGPUStorageLimits,
   resolveBackend,
 } from "./webgpu/capability";
 
@@ -380,7 +381,17 @@ export class SparkRenderer extends THREE.Mesh {
     if (backend === "webgpu") {
       try {
         const { WebGPURenderer } = await import("three/webgpu");
-        const renderer = new WebGPURenderer(params);
+        // Raise maxStorageBufferBindingSize/maxBufferSize to the adapter maxima
+        // so large splat sets (whose per-splat buffers exceed the 128 MiB
+        // default) bind successfully. Caller-supplied limits take precedence.
+        const autoLimits = await requestWebGPUStorageLimits();
+        const callerLimits =
+          (params as { requiredLimits?: Record<string, number> })
+            .requiredLimits ?? {};
+        const renderer = new WebGPURenderer({
+          ...params,
+          requiredLimits: { ...autoLimits, ...callerLimits },
+        });
         await renderer.init();
         return { renderer, backend: "webgpu" };
       } catch (error) {

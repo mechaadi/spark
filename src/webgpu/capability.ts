@@ -41,6 +41,38 @@ export async function canRequestWebGPUAdapter(): Promise<boolean> {
 }
 
 /**
+ * Requests a WebGPU adapter and returns its storage-buffer limits, for use as
+ * `requiredLimits` when constructing the THREE `WebGPURenderer`.
+ *
+ * The WebGPU default `maxStorageBufferBindingSize` is only 128 MiB, but Spark's
+ * per-splat projection buffer is 64 bytes/splat, so a scene past ~2M splats
+ * exceeds it and bind-group creation fails ("Binding size … is larger than the
+ * maximum storage buffer binding size"). THREE forwards `requiredLimits`
+ * verbatim to `requestDevice`, so the requested values must come from a real
+ * adapter (asking for more than it supports would fail the device request).
+ * Returns the adapter's true maxima, or undefined if WebGPU/the adapter is
+ * unavailable.
+ */
+export async function requestWebGPUStorageLimits(): Promise<
+  { maxStorageBufferBindingSize: number; maxBufferSize: number } | undefined
+> {
+  if (!isWebGPUAvailable()) {
+    return undefined;
+  }
+  try {
+    const gpu = (navigator as Navigator & { gpu: GPU }).gpu;
+    const adapter = await gpu.requestAdapter();
+    if (!adapter) {
+      return undefined;
+    }
+    const { maxStorageBufferBindingSize, maxBufferSize } = adapter.limits;
+    return { maxStorageBufferBindingSize, maxBufferSize };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Resolves which backend to use given an optional forced override (e.g. from a
  * `?sparkBackend=` URL param in examples/tests) and runtime capability.
  *
