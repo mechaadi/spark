@@ -4,7 +4,7 @@ import type { PackedSplats } from "../PackedSplats";
 import type { SplatMesh } from "../SplatMesh";
 import {
   WGSL_COV2D,
-  WGSL_DEPTH_KEY,
+  WGSL_DEPTH_KEY16,
   WGSL_EVAL_SH1,
   WGSL_EVAL_SH2,
   WGSL_EVAL_SH3,
@@ -14,10 +14,11 @@ import {
   WGSL_UNPACK_SCALES,
 } from "./wgsl";
 
-// Stable LSD radix sort over a 16-bit depth key (top 16 bits of the 32-bit
-// far->near key), 2 passes of 8 bits. A *stable* sort is required: the draw
-// order of splats within the same quantized depth must be deterministic frame
-// to frame, otherwise alpha blending of overlapping splats flickers. Each tile
+// Stable LSD radix sort over a 16-bit depth key (radial distance normalized to
+// the model's depth extent; see WGSL_DEPTH_KEY16), 2 passes of 8 bits. A
+// *stable* sort is required: the draw order of splats within the same quantized
+// depth must be deterministic frame to frame, otherwise alpha blending of
+// overlapping splats flickers. Each tile
 // owns a disjoint span of TILE elements and writes to a disjoint output range,
 // so count/scatter need no atomics, and the only inter-dispatch dependencies
 // are dispatched as separate (synchronized) passes.
@@ -122,6 +123,13 @@ export class WebGPUSplatRenderer extends THREE.Group {
   private uMaxStdDev: { value: number } | null = null;
   private uMinAlpha: { value: number } | null = null;
   private uMaxPixelRadius: { value: number } | null = null;
+  // Radial view-distance range of the model, recomputed per frame from the
+  // object-space bounding sphere, so the 16-bit depth key resolves finely.
+  private uDepthMin: { value: number } | null = null;
+  private uDepthMax: { value: number } | null = null;
+  // Object-space bounding sphere of the splat centers (set in setSplatMesh).
+  private readonly boundCenter = new THREE.Vector3();
+  private boundRadius = 0;
 
   // Per-frame reused temporaries (avoid allocation in the loop).
   private readonly tmpModelView = new THREE.Matrix4();
@@ -129,6 +137,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
   private readonly tmpViewInverse = new THREE.Matrix4();
   private readonly tmpObjInverse = new THREE.Matrix4();
   private readonly tmpCamPos = new THREE.Vector3();
+  private readonly tmpSphere = new THREE.Vector3();
   private readonly tmpSize = new THREE.Vector2();
 
   maxStdDev = Math.sqrt(8.0);
@@ -183,6 +192,14 @@ export class WebGPUSplatRenderer extends THREE.Group {
 
     const numSplats = packed.numSplats;
     this.numSplats = numSplats;
+
+    // Object-space bounding sphere of the splat centers: drives the per-frame
+    // depth-key normalization (WGSL_DEPTH_KEY16) so all 16 key bits resolve
+    // depth within the model rather than wasting range on the float exponent.
+    const box = mesh.getBoundingBox(true);
+    box.getCenter(this.boundCenter);
+    this.boundRadius = box.getSize(this.tmpSphere).length() * 0.5;
+
     const packedArray = packed.packedArray.subarray(0, numSplats * 4);
     const numTiles = Math.ceil(numSplats / TILE);
     const histLen = numTiles * RADIX;
@@ -281,7 +298,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
     const unpackScales = wgslFn(WGSL_UNPACK_SCALES);
     const unpackQuat = wgslFn(WGSL_UNPACK_QUAT);
     const cov2DOf = wgslFn(WGSL_COV2D);
-    const depthKey = wgslFn(WGSL_DEPTH_KEY);
+    const depthKey16 = wgslFn(WGSL_DEPTH_KEY16);
 
     const sba = (a: StorageBufferAttribute | null) =>
       a as StorageBufferAttribute;
@@ -306,6 +323,10 @@ export class WebGPUSplatRenderer extends THREE.Group {
     const uMaxStdDev = uniform(this.maxStdDev);
     const uMinAlpha = uniform(this.minAlpha);
     const uMaxPixelRadius = uniform(this.maxPixelRadius);
+    const uDepthMin = uniform(0.0);
+    const uDepthMax = uniform(1.0);
+    this.uDepthMin = uDepthMin as unknown as { value: number };
+    this.uDepthMax = uDepthMax as unknown as { value: number };
     this.uModelView = uModelView as unknown as { value: THREE.Matrix4 };
     this.uModelView3 = uModelView3 as unknown as { value: THREE.Matrix3 };
     this.uProjection = uProjection as unknown as { value: THREE.Matrix4 };
@@ -434,8 +455,10 @@ export class WebGPUSplatRenderer extends THREE.Group {
             .element(base.add(2))
             .assign(vec4(rgb.x, rgb.y, rgb.z, alpha));
           projStore.element(base.add(3)).assign(vec4(adj, 1.0, 0.0, 0.0));
-          // 16-bit depth key = top 16 bits of the 32-bit far->near key.
-          keyAStore.element(i).assign(depthKey(viewC.length()).shiftRight(16));
+          // 16-bit far->near key, normalized to the model's view-depth range.
+          keyAStore
+            .element(i)
+            .assign(depthKey16(viewC.length(), uDepthMin, uDepthMax));
         });
       });
     });
@@ -693,6 +716,21 @@ export class WebGPUSplatRenderer extends THREE.Group {
     (this.uMaxStdDev as { value: number }).value = this.maxStdDev;
     (this.uMinAlpha as { value: number }).value = this.minAlpha;
     (this.uMaxPixelRadius as { value: number }).value = this.maxPixelRadius;
+
+    // View-space radial-distance range of the model's bounding sphere, used to
+    // normalize the 16-bit depth key. The view-space radius scales by the
+    // model-view's largest axis scale (the view part is rigid).
+    this.tmpSphere.copy(this.boundCenter).applyMatrix4(this.tmpModelView);
+    const centerDist = this.tmpSphere.length();
+    const e = this.tmpModelView3.elements;
+    const scale = Math.max(
+      Math.hypot(e[0], e[1], e[2]),
+      Math.hypot(e[3], e[4], e[5]),
+      Math.hypot(e[6], e[7], e[8]),
+    );
+    const r = this.boundRadius * scale + 1e-4;
+    (this.uDepthMin as { value: number }).value = Math.max(0, centerDist - r);
+    (this.uDepthMax as { value: number }).value = centerDist + r;
 
     // GPU compute: project every splat, then radix-sort by depth in-frame.
     // Each stage is dispatched as its own compute pass: THREE runs an array of

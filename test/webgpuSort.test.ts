@@ -139,24 +139,41 @@ check(new Uint32Array(2048).fill(42), "all-equal");
   }
 }
 
-// 16-bit depth key (mirror of WGSL: depthKey(d) >> 16). Larger depth -> smaller
-// key, so the ascending sort draws far -> near.
-function depthKey16(depth: number): number {
-  const u = new Uint32Array(new Float32Array([depth]).buffer)[0];
-  const mask = u & 0x80000000 ? 0xffffffff : 0x80000000;
-  return (~(u ^ mask) >>> 16) & 0xffff;
+// 16-bit depth key (mirror of WGSL sparkDepthKey16): radial distance normalized
+// to the model's [min,max] range. Larger distance -> smaller key, so the
+// ascending sort draws far -> near. 0xffff is reserved for the inactive sentinel.
+function depthKey16(dist: number, minDist: number, maxDist: number): number {
+  const t = Math.min(
+    1,
+    Math.max(0, (dist - minDist) / Math.max(maxDist - minDist, 1e-6)),
+  );
+  return Math.round((1 - t) * 65534);
 }
 {
-  const depths = [0, 0.001, 0.5, 1, 2, 10, 100, 1000, 1e5];
+  // A tightly-clustered model (the case the raw float->top-16 key handled badly):
+  // distances spanning a narrow band must still spread across the full key range.
+  const minD = 2.5;
+  const maxD = 3.5;
+  const depths = [2.5, 2.6, 2.9, 3.0, 3.1, 3.4, 3.5];
   for (let i = 1; i < depths.length; i++) {
     assert.ok(
-      depthKey16(depths[i]) <= depthKey16(depths[i - 1]),
-      `depthKey16 not non-increasing with depth at ${depths[i]}`,
+      depthKey16(depths[i], minD, maxD) < depthKey16(depths[i - 1], minD, maxD),
+      `depthKey16 not strictly decreasing with depth at ${depths[i]}`,
     );
   }
+  // Full-range spread: nearest -> ~0xfffe, farthest -> 0, all below the sentinel.
+  assert.strictEqual(depthKey16(minD, minD, maxD), 65534, "near key not maxed");
+  assert.strictEqual(depthKey16(maxD, minD, maxD), 0, "far key not zeroed");
   for (const d of depths) {
-    assert.ok(depthKey16(d) < 0xffff, "active key collides with sentinel");
+    assert.ok(depthKey16(d, minD, maxD) < 0xffff, "active key hits sentinel");
   }
+  // Out-of-range distances clamp instead of wrapping.
+  assert.strictEqual(
+    depthKey16(1.0, minD, maxD),
+    65534,
+    "below-min not clamped",
+  );
+  assert.strictEqual(depthKey16(9.0, minD, maxD), 0, "above-max not clamped");
 }
 
 console.log("✅ All WebGPU sort test cases passed!");

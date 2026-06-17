@@ -185,17 +185,26 @@ fn sparkEvalSH3( d : vec4<u32>, dir : vec3<f32>, shMax : f32 ) -> vec3<f32> {
 `;
 
 /**
- * Map a non-negative depth (radial camera distance) to a 32-bit sort key such
- * that ascending integer sort orders splats **far -> near** (painter's order).
+ * Quantize a radial camera distance to a 16-bit sort key, normalized to the
+ * scene's actual `[minDist, maxDist]` depth range so all 16 bits resolve depth
+ * within the model.
  *
- * The classic float->sortable-uint flip (`bits ^ 0x80000000` for f >= 0) is
- * monotonically increasing in depth; bit-inverting it makes the key decrease
- * with depth, so the radix sort's ascending output draws farthest first.
+ * Taking the top 16 bits of the raw float instead would waste almost the entire
+ * range on the (near-constant) sign + exponent of a tightly-clustered model:
+ * e.g. a butterfly sitting at radial distance ~3 spans only ~64 distinct
+ * top-16-bit codes, collapsing ~16k splats into each depth bucket. Equal-key
+ * splats then blend in arbitrary index order, so view-dependent (e.g. green
+ * iridescent) splats draw in front of splats that should occlude them -> visible
+ * colour speckle. Normalizing to the model's depth extent gives the full 65535
+ * codes meaningful spread.
+ *
+ * Larger distance -> smaller key, so the radix sort's ascending output draws
+ * far -> near (painter's order). `0xffff` is reserved for the inactive sentinel,
+ * so active keys span `0..0xfffe`.
  */
-export const WGSL_DEPTH_KEY = /* wgsl */ `
-fn sparkDepthKey( depth : f32 ) -> u32 {
-  let u = bitcast<u32>( depth );
-  let mask = select( 0x80000000u, 0xffffffffu, ( u & 0x80000000u ) != 0u );
-  return ~( u ^ mask );
+export const WGSL_DEPTH_KEY16 = /* wgsl */ `
+fn sparkDepthKey16( dist : f32, minDist : f32, maxDist : f32 ) -> u32 {
+  let t = clamp( ( dist - minDist ) / max( maxDist - minDist, 1e-6 ), 0.0, 1.0 );
+  return u32( round( ( 1.0 - t ) * 65534.0 ) );
 }
 `;
