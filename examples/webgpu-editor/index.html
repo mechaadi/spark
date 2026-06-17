@@ -190,6 +190,14 @@
     // replaces whatever was loaded before. ExtSplats/Paged/dyno scenes belong
     // on the WebGL2 ../editor/ page (directives D4/D5/D6).
     let currentMesh = null;
+    let modelRadius = 1; // half-diagonal of the loaded model, for size-based culling
+
+    // Cull big "floater" splats: threshold is a fraction of the model size, so it
+    // ports across scenes. 1 keeps everything; lower trims diffuse background blobs.
+    function applyTrimFloaters() {
+      spark.maxSplatScale =
+        guiOptions.trimFloaters >= 1 ? Infinity : guiOptions.trimFloaters * modelRadius;
+    }
 
     async function loadSource(src) {
       const init = typeof src === "string" ? { url: src } : { fileBytes: src.bytes, fileName: src.name };
@@ -214,6 +222,9 @@
         ? src.split("/").pop().split("?")[0]
         : src.name;
       updateBadge();
+      modelRadius =
+        mesh.getBoundingBox(true).getSize(new THREE.Vector3()).length() * 0.5;
+      applyTrimFloaters();
       recenterTarget();
     }
 
@@ -235,6 +246,7 @@
       source: "—",
       splatCount: "—",
       enableSh: true,
+      trimFloaters: 1,
       coordSystem: "OpenGL",
       orbit: true,
       reversePointerDir: false,
@@ -340,6 +352,9 @@
     renderFolder.add(spark, "maxStdDev", 0.5, 4, 0.01).name("Max Gsplat stddev").listen();
     renderFolder.add(spark, "minAlpha", 0, 0.1, 0.0005).name("Min alpha").listen();
     renderFolder.add(spark, "maxPixelRadius", 16, 1024, 1).name("Max pixel radius");
+    // Drag below 1 to cull oversized floater splats (fraction of model size).
+    renderFolder.add(guiOptions, "trimFloaters", 0.002, 1, 0.002)
+      .name("Max splat size").onChange(applyTrimFloaters);
     // Presets: "Spark default" matches the WebGL path (wide Gaussians, keep
     // almost everything); "Crisp" tightens the Gaussian cutoff and culls faint
     // floaters for a sharper, SuperSplat-like look.
