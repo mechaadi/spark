@@ -6707,7 +6707,9 @@ var splatVertex_default = "precision highp float;\nprecision highp int;\nprecisi
 let shaders = null;
 function getShaders() {
   if (!shaders) {
-    THREE.ShaderChunk.splatDefines = splatDefines_default;
+    if (THREE.ShaderChunk) {
+      THREE.ShaderChunk.splatDefines = splatDefines_default;
+    }
     shaders = {
       splatVertex: splatVertex_default,
       splatFragment: splatFragment_default,

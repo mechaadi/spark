@@ -69,6 +69,18 @@
   <input id="file-input" type="file"
     accept=".ply,.spz,.splat,.ksplat,.zip,.sog,.rad" style="display:none" />
 
+  <!-- Surface load-time errors on screen (the editor is otherwise a black canvas
+       if module init fails) so problems are visible on a deployed build. -->
+  <script>
+    function showFatal(msg) {
+      const b = document.getElementById("badge");
+      if (b) b.textContent = "Error:\n" + msg;
+    }
+    addEventListener("error", (e) =>
+      showFatal(`${e.message}\n@ ${(e.filename || "").split("/").pop()}:${e.lineno}`));
+    addEventListener("unhandledrejection", (e) =>
+      showFatal(String((e.reason && (e.reason.stack || e.reason.message)) || e.reason)));
+  </script>
   <script src="/examples/js/vendor/stats.js/build/stats.min.js"></script>
   <script type="importmap">
     {
