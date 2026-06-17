@@ -51,17 +51,30 @@ restored, reaching close visual parity with the WebGL path.
   `hello-world` example side by side. Zero WebGPU validation errors. (Direct A/B
   screenshots captured during development.)
 
-## Known residual (for Phase 5 parity tuning)
+## Color-space parity (resolved)
 
-- A slight saturation/brightness difference remains vs WebGL. This is
-  **color-space / tone-mapping**, not the splat math: `WebGPURenderer` applies
-  its own output color-space transform and tone mapping, which differ from the
-  classic `WebGLRenderer` + Spark fragment's `encodeLinear`/sRGB handling. The
-  Phase 5 perceptual-parity pass (threshold diff, not bit-exact per D8) will tune
-  output color space / tone mapping to match, and add the `srgbToLinear` step the
-  WebGL fragment applies when `encodeLinear` is set.
-- Exact-pose A/B comparison is approximate here because both examples auto-rotate;
-  the Phase 5 harness drives an identical fixed camera path on both backends.
+The first fixed-pose A/B comparison (`examples/webgpu-compare/`) showed identical
+splat *shapes* but a washed-out, pink-shifted color vs WebGL's saturated
+orange — the classic **double-sRGB** symptom. `WebGPURenderer` applies a
+linear->sRGB output conversion to the fragment color, but Spark's stored splat
+colors are already sRGB. The fragment now applies `srgbToLinear` (`pow(rgb,
+2.2)`, `max(0)` guarding negative SH lobes) before output — matching the WebGL
+fragment's `encodeLinear` path — so the renderer's output conversion lands on the
+correct on-screen color. After the fix the two backends match closely at an
+identical fixed pose.
+
+## Comparison harness
+
+`examples/webgpu-compare/webgpu.html` and `.../webgl.html` render the butterfly
+at an identical fixed transform + camera (no rotation), one per THREE build, for
+apples-to-apples A/B capture. The Phase 5 parity harness generalizes this to a
+fixed camera path + threshold diff.
+
+## Residual (minor, for Phase 5)
+
+- A small difference in overall contrast / SH-sparkle prominence remains
+  (WebGL slightly smoother; WebGPU a touch more contrasty). Within the perceptual
+  threshold (D8 allows non-bit-exact); Phase 5 tunes tone mapping if needed.
 
 ## Compute pipeline now (per frame, in submission order)
 

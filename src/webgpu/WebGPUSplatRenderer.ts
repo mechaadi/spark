@@ -556,7 +556,11 @@ export class WebGPUSplatRenderer extends THREE.Group {
       If(alpha.lessThan(uMinAlpha.value), () => {
         Discard();
       });
-      return vec4(vColor.xyz.mul(alpha), alpha);
+      // Match Spark's WebGL fragment (encodeLinear): the stored splat color is
+      // sRGB; convert to linear so WebGPURenderer's linear->sRGB output yields
+      // the same on-screen color. max(0) guards against negative SH lobes.
+      const linear = vColor.xyz.max(0.0).pow(2.2);
+      return vec4(linear.mul(alpha), alpha);
     })();
 
     return material;

@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spark • Compare (WebGL2)</title>
+  <style>
+    body { margin: 0; background: #111; }
+    #info { position: fixed; top: 8px; left: 8px; font: 12px monospace;
+      color: #fff; background: rgba(0,0,0,0.5); padding: 6px 8px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <div id="info">WebGL2</div>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "../js/vendor/three/build/three.module.js",
+        "three/addons/": "../js/vendor/three/examples/jsm/",
+        "@sparkjsdev/spark": "../../dist/spark.module.js"
+      }
+    }
+  </script>
+  <script type="module">
+    import * as THREE from "three";
+    import { SplatMesh, SparkRenderer } from "@sparkjsdev/spark";
+    import { getAssetFileURL } from "../js/get-asset-url.js";
+
+    // Same fixed pose as webgpu.html (identity orientation, no rotation).
+    const SIZE = 800;
+    const renderer = new THREE.WebGLRenderer({ antialias: false });
+    renderer.setSize(SIZE, SIZE);
+    document.body.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 1000);
+
+    const spark = new SparkRenderer({ renderer });
+    scene.add(spark);
+
+    const splatURL = await getAssetFileURL("butterfly.spz");
+    const butterfly = new SplatMesh({ url: splatURL });
+    await butterfly.initialized;
+    butterfly.position.set(0, 0, -3);   // fixed pose, no rotation
+    scene.add(butterfly);
+
+    renderer.setAnimationLoop(() => {
+      renderer.render(scene, camera);
+    });
+  </script>
+</body>
+</html>
