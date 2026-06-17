@@ -43,7 +43,9 @@
     const butterfly = new SplatMesh({ url: splatURL });
     await butterfly.initialized;
 
-    const spark = new WebGPUSplatRenderer({ renderer });
+    // Append ?nosh to the URL to disable spherical harmonics (base color only).
+    const enableSh = !new URLSearchParams(location.search).has("nosh");
+    const spark = new WebGPUSplatRenderer({ renderer, enableSh });
     await spark.init();
     scene.add(spark);
     spark.position.set(0, 0, -3);   // fixed pose, no rotation

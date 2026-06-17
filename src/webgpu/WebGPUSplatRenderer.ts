@@ -35,6 +35,13 @@ type StorageBufferAttribute = InstanceType<WGPU["StorageBufferAttribute"]>;
 export interface WebGPUSplatRendererOptions {
   /** A pre-initialized THREE.WebGPURenderer (await `renderer.init()` first). */
   renderer: WebGPURenderer;
+  /**
+   * Evaluate spherical-harmonics (view-dependent) color when the mesh has it.
+   * Set false to render base color only (useful for A/B comparison). Can also
+   * be toggled later via the `enableSh` property before `setSplatMesh`.
+   * @default true
+   */
+  enableSh?: boolean;
 }
 
 /**
@@ -120,6 +127,8 @@ export class WebGPUSplatRenderer extends THREE.Group {
   maxStdDev = Math.sqrt(8.0);
   minAlpha = 0.5 * (1.0 / 255.0);
   maxPixelRadius = 512.0;
+  /** Evaluate SH color (read on the next `setSplatMesh`). */
+  enableSh = true;
 
   constructor(options: WebGPUSplatRendererOptions) {
     super();
@@ -127,6 +136,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
       throw new Error("WebGPUSplatRenderer requires a THREE.WebGPURenderer");
     }
     this.renderer = options.renderer;
+    this.enableSh = options.enableSh ?? true;
     this.frustumCulled = false;
   }
 
@@ -211,7 +221,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
         itemSize,
       );
     this.numSh = 0;
-    if (extra.sh1 && extra.sh1.length >= numSplats * 2) {
+    if (this.enableSh && extra.sh1 && extra.sh1.length >= numSplats * 2) {
       this.sh1Attr = shBuf(extra.sh1, 2);
       this.numSh = 1;
       if (extra.sh2 && extra.sh2.length >= numSplats * 4) {
