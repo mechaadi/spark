@@ -89,8 +89,10 @@
     import { GUI } from "lil-gui";
     import {
       SplatMesh,
+      SparkControls,
       WebGPUSplatRenderer,
       isWebGPUAvailable,
+      requestWebGPUStorageLimits,
     } from "@sparkjsdev/spark";
     import { getAssetFileURL } from "../js/get-asset-url.js";
 
@@ -108,7 +110,11 @@
     }
 
     // --- Renderer / scene -------------------------------------------------
-    const renderer = new WebGPURenderer({ canvas, antialias: false });
+    // Raise the storage-buffer limits to the adapter maxima so large splat sets
+    // (the per-splat projection buffer is 64 B/splat, past the 128 MiB default
+    // binding size around ~2M splats) bind without error.
+    const requiredLimits = (await requestWebGPUStorageLimits()) ?? {};
+    const renderer = new WebGPURenderer({ canvas, antialias: false, requiredLimits });
     await renderer.init();
 
     const scene = new THREE.Scene();
@@ -121,11 +127,16 @@
     await spark.init();
     scene.add(spark);
 
+    // Two camera control schemes, toggled in the GUI: OrbitControls (orbit a
+    // target) and Spark's pointer/fly controls (SparkControls, which exposes the
+    // reverse-pointer options). Only one drives the camera per frame.
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.target.set(0, 0, 0);
     controls.enableDamping = true;
     controls.minDistance = 0.2;
     controls.maxDistance = 50;
+
+    const sparkControls = new SparkControls({ canvas });
 
     // Base orientation applied to the splat so files authored in different
     // conventions (Y-up OpenGL, Y-down OpenCV, Z-up) sit upright. Spark's group
@@ -225,6 +236,9 @@
       splatCount: "—",
       enableSh: true,
       coordSystem: "OpenGL",
+      orbit: true,
+      reversePointerDir: false,
+      reversePointerSlide: false,
       autoRotate: false,
       highDpi: true,
       background: "#000000",
@@ -276,6 +290,20 @@
     cameraFolder.add(guiOptions, "autoRotate").name("Auto rotate").onChange((v) => {
       controls.autoRotate = v;
     });
+    cameraFolder.add(guiOptions, "orbit").name("Orbit controls").onChange((v) => {
+      controls.enabled = v;
+      canvas.focus();
+    });
+    cameraFolder.add(guiOptions, "reversePointerDir").name("Reverse ptr direction")
+      .onChange((v) => {
+        sparkControls.pointerControls.reverseRotate = v;
+        sparkControls.pointerControls.reverseScroll = v;
+      });
+    cameraFolder.add(guiOptions, "reversePointerSlide").name("Reverse ptr slide")
+      .onChange((v) => {
+        sparkControls.pointerControls.reverseSlide = v;
+        sparkControls.pointerControls.reverseSwipe = v;
+      });
 
     // --- View ---
     const viewFolder = gui.addFolder("View");
@@ -340,7 +368,11 @@
     // --- Render loop ------------------------------------------------------
     renderer.setAnimationLoop(async () => {
       stats.begin();
-      controls.update();
+      if (guiOptions.orbit) {
+        controls.update();
+      } else {
+        sparkControls.update(camera);
+      }
       await spark.renderFrame(scene, camera);
       stats.end();
     });
