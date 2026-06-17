@@ -412,6 +412,11 @@ export class WebGPUSplatRenderer extends THREE.Group {
             if (sh3Eval && sh3S) {
               rgb.addAssign(sh3Eval(sh3S.element(i), dir, uShMax.z));
             }
+            // The WebGL path bakes base+SH into an 8-bit color texture, which
+            // clamps it to [0,1] (packSplatEncoding). Match that here, otherwise
+            // extreme per-splat SH values blow past 1.0 and show as bright
+            // speckle that WebGL never displays.
+            rgb.assign(rgb.clamp(0.0, 1.0));
           }
 
           const ndc = clip.xyz.div(clip.w);
