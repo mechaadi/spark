@@ -3,10 +3,12 @@ import type { WebGPURenderer } from "three/webgpu";
 import type { PackedSplats } from "../PackedSplats";
 import type { SplatMesh } from "../SplatMesh";
 import {
+  WGSL_COV2D,
   WGSL_DEPTH_KEY,
   WGSL_UNPACK_CENTER,
-  WGSL_UNPACK_MAX_SCALE,
+  WGSL_UNPACK_QUAT,
   WGSL_UNPACK_RGBA,
+  WGSL_UNPACK_SCALES,
 } from "./wgsl";
 
 // Tiling for the GPU LSD radix sort: each tile owns a disjoint span of TILE
@@ -30,18 +32,18 @@ export interface WebGPUSplatRendererOptions {
 }
 
 /**
- * WebGPU splat backend (Phases 2-3).
+ * WebGPU splat backend (Phases 2-4).
  *
  * Renders a SplatMesh entirely on the GPU through THREE.WebGPURenderer:
- * packed-splat storage-buffer upload, a per-splat compute project pass, an
- * **in-frame GPU LSD radix sort** of depth keys, and an instanced raster draw
- * into the scene's shared depth buffer. The sort is produced and consumed in
- * the same frame — no GPU->CPU readback, no worker round-trip, no sort lag.
+ * packed-splat storage-buffer upload, a per-splat compute project pass (full
+ * anisotropic 2D-covariance projection), an **in-frame GPU LSD radix sort** of
+ * depth keys, and an instanced raster draw into the scene's shared depth buffer.
+ * The sort is produced and consumed in the same frame — no GPU->CPU readback, no
+ * worker round-trip, no sort lag.
  *
  * Scope/caveats (documented, replaced in later phases):
- * - Projection is *isotropic* (round splats sized by max scale). Full
- *   anisotropic 2D-covariance projection + SH lands in Phase 4 ("GPU
- *   cull+project").
+ * - Spherical harmonics are not yet evaluated (flat base color); SH<=3 lands in
+ *   Phase 4B.
  * - The radix sort uses a simple one-tile-per-invocation layout (no atomics);
  *   a workgroup-shared optimization is a Phase 5 perf item.
  * - Only `PackedSplats` residency is supported here; ExtSplats/Paged are routed
@@ -84,17 +86,23 @@ export class WebGPUSplatRenderer extends THREE.Group {
 
   // Uniform nodes (their `.value` is updated per frame).
   private uModelView: { value: THREE.Matrix4 } | null = null;
+  private uModelView3: { value: THREE.Matrix3 } | null = null;
   private uProjection: { value: THREE.Matrix4 } | null = null;
   private uProjScale: { value: THREE.Vector2 } | null = null;
+  private uRenderSize: { value: THREE.Vector2 } | null = null;
   private uMaxStdDev: { value: number } | null = null;
   private uMinAlpha: { value: number } | null = null;
+  private uMaxPixelRadius: { value: number } | null = null;
 
   // Per-frame reused temporaries (avoid allocation in the loop).
   private readonly tmpModelView = new THREE.Matrix4();
+  private readonly tmpModelView3 = new THREE.Matrix3();
   private readonly tmpViewInverse = new THREE.Matrix4();
+  private readonly tmpSize = new THREE.Vector2();
 
   maxStdDev = Math.sqrt(8.0);
   minAlpha = 0.5 * (1.0 / 255.0);
+  maxPixelRadius = 512.0;
 
   constructor(options: WebGPUSplatRendererOptions) {
     super();
@@ -183,18 +191,27 @@ export class WebGPUSplatRenderer extends THREE.Group {
       If,
       Loop,
       instanceIndex,
+      vec2,
       vec4,
+      float,
       uint,
       uniform,
       storage,
       wgslFn,
+      normalize,
+      select,
+      min,
+      max,
+      sqrt,
     } = tsl;
     const N = this.numSplats;
     const histLen = numTiles * RADIX;
 
     const unpackCenter = wgslFn(WGSL_UNPACK_CENTER);
     const unpackRgba = wgslFn(WGSL_UNPACK_RGBA);
-    const unpackMaxScale = wgslFn(WGSL_UNPACK_MAX_SCALE);
+    const unpackScales = wgslFn(WGSL_UNPACK_SCALES);
+    const unpackQuat = wgslFn(WGSL_UNPACK_QUAT);
+    const cov2DOf = wgslFn(WGSL_COV2D);
     const depthKey = wgslFn(WGSL_DEPTH_KEY);
 
     const sba = (a: StorageBufferAttribute | null) =>
@@ -209,23 +226,33 @@ export class WebGPUSplatRenderer extends THREE.Group {
     const baseStore = storage(sba(this.tileBase), "uint", histLen);
 
     const uModelView = uniform(new THREE.Matrix4());
+    const uModelView3 = uniform(new THREE.Matrix3());
     const uProjection = uniform(new THREE.Matrix4());
     const uProjScale = uniform(new THREE.Vector2(1, 1));
+    const uRenderSize = uniform(new THREE.Vector2(1, 1));
     const uMaxStdDev = uniform(this.maxStdDev);
     const uMinAlpha = uniform(this.minAlpha);
+    const uMaxPixelRadius = uniform(this.maxPixelRadius);
     this.uModelView = uModelView as unknown as { value: THREE.Matrix4 };
+    this.uModelView3 = uModelView3 as unknown as { value: THREE.Matrix3 };
     this.uProjection = uProjection as unknown as { value: THREE.Matrix4 };
     this.uProjScale = uProjScale as unknown as { value: THREE.Vector2 };
+    this.uRenderSize = uRenderSize as unknown as { value: THREE.Vector2 };
     this.uMaxStdDev = uMaxStdDev as unknown as { value: number };
     this.uMinAlpha = uMinAlpha as unknown as { value: number };
+    this.uMaxPixelRadius = uMaxPixelRadius as unknown as { value: number };
 
-    // --- Pass A: project + write depth key + identity payload ---
+    // --- Pass A: project (full anisotropic covariance) + depth key + payload ---
+    // Port of the standard-splat path in src/shaders/splatVertex.glsl: build the
+    // view-space 3D covariance, project it through the perspective Jacobian to a
+    // 2D covariance, eigen-decompose it into screen-space ellipse axes.
     const project = Fn(() => {
       const i = instanceIndex;
       const pk = packedStore.element(i);
       const center = unpackCenter(pk);
       const rgba = unpackRgba(pk);
-      const maxScale = unpackMaxScale(pk);
+      const scales = unpackScales(pk);
+      const quat = unpackQuat(pk);
 
       const base = i.mul(4);
       const zero = vec4(0.0, 0.0, 0.0, 0.0);
@@ -247,6 +274,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
         adj.assign(uMaxStdDev.add(a.sub(1.0).mul(0.7)));
       });
 
+      const maxScale = max(scales.x, max(scales.y, scales.z));
       const active = viewC.z
         .lessThan(0.0)
         .and(maxScale.greaterThan(0.0))
@@ -254,15 +282,49 @@ export class WebGPUSplatRenderer extends THREE.Group {
       If(active, () => {
         const clip = uProjection.mul(vec4(viewC, 1.0)).toVar();
         If(clip.w.greaterThan(0.0), () => {
+          // Projected 2D covariance (a, d, b) for [[a, b], [b, d]].
+          const focal = uRenderSize.mul(0.5).mul(uProjScale); // pixels
+          const cov = cov2DOf(uModelView3, scales, quat, focal, viewC);
+          const covA0 = cov.x;
+          const covD0 = cov.y;
+          const covB = cov.z;
+
+          // 0.5px Gaussian anti-alias blur + intensity compensation.
+          const blur = float(0.3);
+          const detOrig = covA0.mul(covD0).sub(covB.mul(covB));
+          const covA = covA0.add(blur);
+          const covD = covD0.add(blur);
+          const det = covA.mul(covD).sub(covB.mul(covB));
+          const blurAdjust = sqrt(max(0.0, detOrig.div(det)));
+          const alpha = a.mul(blurAdjust);
+
+          // Eigen-decomposition of the 2D covariance.
+          const eigenAvg = covA.add(covD).mul(0.5);
+          const eigenDelta = sqrt(max(0.0, eigenAvg.mul(eigenAvg).sub(det)));
+          const eigen1 = eigenAvg.add(eigenDelta);
+          const eigen2 = eigenAvg.sub(eigenDelta);
+          const eigenVec1 = select(
+            covB.abs().greaterThan(0.001),
+            normalize(vec2(covB, eigen1.sub(covA))),
+            select(covA.greaterThanEqual(covD), vec2(1.0, 0.0), vec2(0.0, 1.0)),
+          );
+          const eigenVec2 = vec2(eigenVec1.y, eigenVec1.x.negate());
+          const scale1 = min(uMaxPixelRadius, adj.mul(sqrt(eigen1)));
+          const scale2 = min(uMaxPixelRadius, adj.mul(sqrt(eigen2)));
+
+          // NDC offsets per unit quad corner along each ellipse axis.
+          const twoOverRS = vec2(2.0, 2.0).div(uRenderSize);
+          const axis1 = eigenVec1.mul(scale1).mul(twoOverRS);
+          const axis2 = eigenVec2.mul(scale2).mul(twoOverRS);
+
           const ndc = clip.xyz.div(clip.w);
-          const r = maxScale.mul(adj).div(viewC.z.negate());
-          const ndcRx = uProjScale.x.mul(r);
-          const ndcRy = uProjScale.y.mul(r);
           projStore.element(base).assign(vec4(ndc.x, ndc.y, clip.z, clip.w));
-          projStore.element(base.add(1)).assign(vec4(ndcRx, 0.0, 0.0, ndcRy));
+          projStore
+            .element(base.add(1))
+            .assign(vec4(axis1.x, axis1.y, axis2.x, axis2.y));
           projStore
             .element(base.add(2))
-            .assign(vec4(rgba.x, rgba.y, rgba.z, a));
+            .assign(vec4(rgba.x, rgba.y, rgba.z, alpha));
           projStore.element(base.add(3)).assign(vec4(adj, 1.0, 0.0, 0.0));
           keyAStore.element(i).assign(depthKey(viewC.length()));
         });
@@ -444,16 +506,23 @@ export class WebGPUSplatRenderer extends THREE.Group {
       this.tmpViewInverse,
       this.mesh.matrixWorld,
     );
+    this.tmpModelView3.setFromMatrix4(this.tmpModelView);
+    this.renderer.getDrawingBufferSize(this.tmpSize);
 
     const proj = (camera as THREE.PerspectiveCamera).projectionMatrix;
     (this.uModelView as { value: THREE.Matrix4 }).value.copy(this.tmpModelView);
+    (this.uModelView3 as { value: THREE.Matrix3 }).value.copy(
+      this.tmpModelView3,
+    );
     (this.uProjection as { value: THREE.Matrix4 }).value.copy(proj);
     (this.uProjScale as { value: THREE.Vector2 }).value.set(
       proj.elements[0],
       proj.elements[5],
     );
+    (this.uRenderSize as { value: THREE.Vector2 }).value.copy(this.tmpSize);
     (this.uMaxStdDev as { value: number }).value = this.maxStdDev;
     (this.uMinAlpha as { value: number }).value = this.minAlpha;
+    (this.uMaxPixelRadius as { value: number }).value = this.maxPixelRadius;
 
     // GPU compute: project every splat, then radix-sort by depth in-frame.
     this.renderer.compute(this.computeNodes as never);
