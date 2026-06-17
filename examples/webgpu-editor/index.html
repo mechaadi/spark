@@ -127,6 +127,36 @@
     controls.minDistance = 0.2;
     controls.maxDistance = 50;
 
+    // Base orientation applied to the splat so files authored in different
+    // conventions (Y-up OpenGL, Y-down OpenCV, Z-up) sit upright. Spark's group
+    // is at the origin, so its quaternion is the model's world orientation.
+    const COORD_QUATS = {
+      OpenGL: new THREE.Quaternion(0, 0, 0, 1),
+      OpenCV: new THREE.Quaternion(1, 0, 0, 0),
+      "Z-up": new THREE.Quaternion(-1, 0, 0, 1).normalize(),
+    };
+
+    // Reference ground grid (a plain THREE line grid, rendered alongside the
+    // splats by the WebGPU renderer). Hidden until opacity > 0.
+    const grid = new THREE.GridHelper(10, 10, 0x666666, 0x333333);
+    grid.material.transparent = true;
+    grid.material.opacity = 0;
+    grid.visible = false;
+    scene.add(grid);
+
+    // Point the orbit target at the loaded model's (oriented) center.
+    function recenterTarget() {
+      if (!currentMesh) return;
+      const center = currentMesh.getBoundingBox(true).getCenter(new THREE.Vector3());
+      controls.target.copy(center.applyQuaternion(spark.quaternion));
+      controls.update();
+    }
+
+    function applyCoordSystem() {
+      spark.quaternion.copy(COORD_QUATS[guiOptions.coordSystem]);
+      recenterTarget();
+    }
+
     const stats = new Stats();
     document.body.appendChild(stats.dom);
     stats.dom.style.display = "none";
@@ -173,9 +203,7 @@
         ? src.split("/").pop().split("?")[0]
         : src.name;
       updateBadge();
-      // Frame the model: point the orbit target at its center.
-      const box = mesh.getBoundingBox(true);
-      box.getCenter(controls.target);
+      recenterTarget();
     }
 
     async function loadFiles(fileList) {
@@ -196,9 +224,11 @@
       source: "—",
       splatCount: "—",
       enableSh: true,
+      coordSystem: "OpenGL",
       autoRotate: false,
       highDpi: true,
       background: "#000000",
+      gridOpacity: 0,
       showStats: false,
       openFile: () => fileInput.click(),
       url: "",
@@ -213,13 +243,15 @@
       },
       resetPose: () => {
         camera.position.set(0, 0, 3);
-        controls.target.set(0, 0, 0);
-        controls.update();
+        camera.fov = 60;
+        camera.updateProjectionMatrix();
+        recenterTarget();
       },
     };
 
     const gui = new GUI({ title: "WebGPU Editor", container: document.getElementById("gui") });
 
+    // --- Scene (loading) ---
     const fileFolder = gui.addFolder("Scene");
     fileFolder.add(guiOptions, "openFile").name("Open file…");
     fileFolder.add(guiOptions, "url").name("URL");
@@ -227,32 +259,57 @@
     fileFolder.add(guiOptions, "source").name("Loaded").listen().disable();
     fileFolder.add(guiOptions, "splatCount").name("Splats").listen().disable();
 
-    const viewFolder = gui.addFolder("View");
-    viewFolder.add(guiOptions, "autoRotate").name("Auto-rotate").onChange((v) => {
+    // --- Camera ---
+    const cameraFolder = gui.addFolder("Camera");
+    const poseFolder = cameraFolder.addFolder("Camera Pose");
+    poseFolder.add(guiOptions, "resetPose").name("Reset pose");
+    // X/Y/Z are a live readout (OrbitControls owns the position each frame, so
+    // editing them would just snap back). FOV is independent of orbit, so it's
+    // editable.
+    poseFolder.add(camera.position, "x", -20, 20, 0.01).name("X").listen().disable();
+    poseFolder.add(camera.position, "y", -20, 20, 0.01).name("Y").listen().disable();
+    poseFolder.add(camera.position, "z", -20, 20, 0.01).name("Z").listen().disable();
+    poseFolder.add(camera, "fov", 1, 179, 1).name("Fov Y degrees").listen()
+      .onChange(() => camera.updateProjectionMatrix());
+    cameraFolder.add(guiOptions, "coordSystem", ["OpenGL", "OpenCV", "Z-up"])
+      .name("Coordinate system").onChange(applyCoordSystem);
+    cameraFolder.add(guiOptions, "autoRotate").name("Auto rotate").onChange((v) => {
       controls.autoRotate = v;
     });
-    viewFolder.add(guiOptions, "resetPose").name("Reset camera");
-    viewFolder.addColor(guiOptions, "background").name("Background").onChange((v) => {
-      scene.background.set(v);
-    });
+
+    // --- View ---
+    const viewFolder = gui.addFolder("View");
     viewFolder.add(guiOptions, "highDpi").name("High DPI").onChange((v) => {
       highDpi = v;
       handleResize();
     });
-    viewFolder.add(guiOptions, "showStats").name("Show FPS").onChange((v) => {
+    viewFolder.add(guiOptions, "showStats").name("Show frame stats").onChange((v) => {
       stats.dom.style.display = v ? "block" : "none";
     });
+    viewFolder.add(guiOptions, "gridOpacity", 0, 1, 0.01).name("Grid opacity").onChange((v) => {
+      grid.material.opacity = v;
+      grid.visible = v > 0;
+    });
+    viewFolder.addColor(guiOptions, "background").name("Background color").onChange((v) => {
+      scene.background.set(v);
+    });
 
-    // Knobs the compute backend actually exposes (see WebGPUSplatRenderer).
+    // --- Splat rendering (the knobs WebGPUSplatRenderer actually exposes) ---
+    // NOTE: depth-of-field (focal distance / aperture), level-of-detail, dyno
+    // clip/debug recolor, radial-sort toggle, and ExtSplats encoding are
+    // WebGL2-path features (SparkRenderer + dyno) and intentionally absent here —
+    // the compute backend always radial-sorts PackedSplats. Use ../editor/ for
+    // those (directives D4/D5/D6).
     const renderFolder = gui.addFolder("Splat rendering");
     renderFolder.add(guiOptions, "enableSh").name("Spherical harmonics").onChange(() => {
       // SH buffers are (un)uploaded in setSplatMesh, so re-apply the mesh.
       if (currentMesh) {
         spark.enableSh = guiOptions.enableSh;
         spark.setSplatMesh(currentMesh);
+        recenterTarget();
       }
     });
-    renderFolder.add(spark, "maxStdDev", 0.5, 4, 0.01).name("Max std dev");
+    renderFolder.add(spark, "maxStdDev", 0.5, 4, 0.01).name("Max Gsplat stddev");
     renderFolder.add(spark, "minAlpha", 0, 0.1, 0.0005).name("Min alpha");
     renderFolder.add(spark, "maxPixelRadius", 16, 1024, 1).name("Max pixel radius");
 
