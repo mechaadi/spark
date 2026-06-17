@@ -39,6 +39,10 @@ Built by [World Labs](https://www.worldlabs.ai).
 - Fully dynamic: each splat can be transformed and edited for animation
 - Real-time splat color editing, displacement, and skeletal animation
 - Shader graph system to dynamically create/edit splats on the GPU
+- Experimental WebGPU backend with an in-frame GPU compute sort (no readback/lag);
+  see [`examples/README-webgpu.md`](examples/README-webgpu.md) and
+  [`docs/webgpu-backend/`](docs/webgpu-backend/). The WebGL2 path remains the
+  default and automatic fallback.
 
 Check out all the [examples](https://sparkjs.dev/examples/)
 
