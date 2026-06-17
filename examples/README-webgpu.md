@@ -26,13 +26,19 @@ has its own page rather than a single dual-canvas page.
 ```js
 import * as THREE from "three";              // -> three/build/three.webgpu.js
 import { WebGPURenderer } from "three/webgpu";
-import { SplatMesh, WebGPUSplatRenderer, isWebGPUAvailable } from "@sparkjsdev/spark";
+import {
+  SplatMesh, WebGPUSplatRenderer, isWebGPUAvailable, requestWebGPUStorageLimits,
+} from "@sparkjsdev/spark";
 
 if (!isWebGPUAvailable()) {
   // fall back to the classic WebGL path (THREE.WebGLRenderer + SparkRenderer)
 }
 
-const renderer = new WebGPURenderer({ antialias: false });
+// Raise the storage-buffer limits to the adapter maxima — the per-splat
+// projection buffer (64 B/splat) exceeds WebGPU's 128 MiB default binding size
+// past ~2M splats. (createRenderer below does this for you.)
+const requiredLimits = (await requestWebGPUStorageLimits()) ?? {};
+const renderer = new WebGPURenderer({ antialias: false, requiredLimits });
 await renderer.init();
 
 const scene = new THREE.Scene();
