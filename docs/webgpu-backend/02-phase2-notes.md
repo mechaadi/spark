@@ -67,30 +67,39 @@ is untouched.
   under one `SplatBackend`-holding `SparkRenderer` is deferred to avoid a large
   refactor of the 2,100-line WebGL renderer; flagged for a later phase.
 
-## Verification status (important — read this)
+## Verification status
 
-- ✅ **Type-checked.** `tsc --noEmit` is clean for all new/edited files. Because
-  `@types/three` ships full TSL/WebGPU typings, this validates the TSL/WGSL API
-  usage (storage buffers, `wgslFn`, compute dispatch, node material, uniforms)
-  against r180 — the API was the main risk and it checks out. (The only `tsc`
-  errors in the repo are the pre-existing `spark-rs` ones: the Rust/WASM package
-  isn't built in this checkout; unrelated to this change.)
-- ✅ **Lint/format clean** (`biome check`).
-- ⚠️ **Not yet run on a GPU.** This environment has no WebGPU browser/GPU, and a
-  runnable bundle needs the Rust/WASM artifact (`npm run build:wasm`, which needs
-  `wasm-pack`, not installed here). So the live render is **not yet visually
-  verified**. The TSL graph is written to known-correct r180 idioms, but on-device
-  validation is the first task of Phase 3.
+- ✅ **Type-checked.** `tsc --noEmit` is fully clean. Because `@types/three`
+  ships full TSL/WebGPU typings, this validates the TSL/WGSL API usage (storage
+  buffers, `wgslFn`, compute dispatch, node material, uniforms) against r180.
+- ✅ **Lint/format clean** (`biome check`, all 88 files) and existing tests pass
+  (via the pre-commit hook).
+- ✅ **Runs on real WebGPU hardware.** Built the Rust/WASM package + dev bundle
+  and loaded `examples/webgpu-hello/` in a WebGPU browser: the butterfly scene
+  renders through `THREE.WebGPURenderer` (`backend: webgpu`), the per-frame loop
+  (compute project pass → CPU sort → `renderAsync`) animates across frames, depth
+  blending is correct, and there are **zero WebGPU validation warnings/errors**.
+- ✅ **Bundle isolation confirmed.** The built `dist/spark.module.js` contains
+  `WebGPUSplatRenderer` with **no static** `three/webgpu` / `three/tsl` imports —
+  only the runtime `import("three/webgpu")` / `import("three/tsl")` — so
+  WebGL-only consumers never load them.
 
-### How to run it (on a machine with the toolchain + a WebGPU browser)
+### Toolchain note (building the Rust/WASM dep)
+
+`npm run build:wasm` needs a rustc that has the `wasm32-unknown-unknown` target
+*and* is new enough for the deps (≥1.88 for the `image` crate). A Homebrew-only
+rust install fails (no wasm32 target); use rustup with its bin dir first on PATH:
 
 ```bash
-npm run build:wasm        # builds rust/spark-rs/pkg (needs rustup + wasm-pack)
-npm run build             # rebuild dist so it includes WebGPUSplatRenderer
-npm run dev               # serve examples
-# open examples/webgpu-hello/  in a WebGPU-capable browser
-# ?sparkBackend=webgl2 is reserved for the dual-backend harness (Phase 5)
+rustup target add wasm32-unknown-unknown
+rustup update stable                      # ensure rustc >= 1.88
+PATH="$HOME/.cargo/bin:$PATH" npm run build:wasm
+npm run build                             # rebuild dist with WebGPUSplatRenderer
+npm run dev                               # serve examples
+# open examples/webgpu-hello/ in a WebGPU-capable browser
 ```
+
+`?sparkBackend=webgl2` is reserved for the dual-backend validation harness (Phase 5).
 
 ## Next: Phase 3
 
