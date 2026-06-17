@@ -1,6 +1,7 @@
 import { ExtSplats, PackedSplats, PagedSplats, SplatMesh, SplatPager } from '.';
 import { SplatAccumulator } from './SplatAccumulator';
 import { SplatWorker } from './SplatWorker';
+import { SparkBackendKind } from './webgpu/capability';
 import * as THREE from "three";
 export interface SparkRendererOptions {
     /**
@@ -20,11 +21,6 @@ export interface SparkRendererOptions {
      * @default true
      */
     premultipliedAlpha?: boolean;
-    /**
-     * Whether to encode Gsplat with linear RGB (for environment mapping)
-     * @default false
-     */
-    encodeLinear?: boolean;
     /**
      * Pass in a THREE.Clock to synchronize time-based effects across different
      * systems. Alternatively, you can set the property time directly.
@@ -180,6 +176,7 @@ export interface SparkRendererOptions {
      * @default false
      */
     lodInflate?: boolean;
+    lodTraverseMode?: "dynamic" | "standard";
     /**
      * Whether to use extended Gsplat encoding for paged splats, useful for eliminating
      * quantization artifacts from splat scenes with large internal position coordinates.
@@ -304,6 +301,33 @@ export declare class SparkRenderer extends THREE.Mesh {
     autoUpdate: boolean;
     preUpdate: boolean;
     static sparkOverride?: SparkRenderer;
+    /**
+     * Capability-detect WebGPU and construct the matching THREE renderer for the
+     * session. This is the blessed way to pick a backend; it encapsulates the
+     * async `WebGPURenderer.init()` and the automatic WebGL2 fallback.
+     *
+     * - WebGPU available (and not forced off) -> a ready `THREE.WebGPURenderer`
+     *   to be driven by the Spark WebGPU backend (`WebGPUSplatRenderer`).
+     * - otherwise -> a classic `THREE.WebGLRenderer` driven by the existing
+     *   WebGL2 `SparkRenderer` path (unchanged).
+     *
+     * The returned `backend` tells the caller which path to wire up. Existing
+     * `new SparkRenderer({ renderer })` usage is unaffected — this is additive.
+     *
+     * `forceBackend` (or a `?sparkBackend=webgpu|webgl2` URL param) overrides
+     * detection for testing and the Phase 5 validation harness.
+     */
+    static createRenderer(options?: {
+        canvas?: HTMLCanvasElement;
+        antialias?: boolean;
+        preferWebGPU?: boolean;
+        forceBackend?: SparkBackendKind;
+        /** Extra parameters forwarded to the chosen THREE renderer constructor. */
+        rendererParameters?: Record<string, unknown>;
+    }): Promise<{
+        renderer: THREE.WebGLRenderer | import('three/webgpu').WebGPURenderer;
+        backend: SparkBackendKind;
+    }>;
     renderSize: THREE.Vector2;
     maxStdDev: number;
     minPixelRadius: number;
@@ -319,7 +343,6 @@ export declare class SparkRenderer extends THREE.Mesh {
     falloff: number;
     clipXY: number;
     focalAdjustment: number;
-    encodeLinear: boolean;
     sortRadial: boolean;
     minSortIntervalMs: number;
     clock: THREE.Clock;
@@ -349,6 +372,7 @@ export declare class SparkRenderer extends THREE.Mesh {
     lodSplatScale: number;
     lodRenderScale: number;
     lodInflate: boolean;
+    lodTraverseMode: "dynamic" | "standard";
     pagedExtSplats: boolean;
     maxPagedSplats: number;
     numLodFetchers: number;
