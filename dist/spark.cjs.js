@@ -15397,15 +15397,10 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
             }
             rgb.assign(rgb.clamp(0, 1));
           }
-          const linRgb = select2(
-            rgb.lessThanEqual(0.04045),
-            rgb.div(12.92),
-            rgb.add(0.055).div(1.055).pow(2.4)
-          );
           const ndc = clip.xyz.div(clip.w);
           projStore.element(base).assign(vec42(ndc.x, ndc.y, clip.z, clip.w));
           projStore.element(base.add(1)).assign(vec42(axis1.x, axis1.y, axis2.x, axis2.y));
-          projStore.element(base.add(2)).assign(vec42(linRgb.x, linRgb.y, linRgb.z, alpha));
+          projStore.element(base.add(2)).assign(vec42(rgb.x, rgb.y, rgb.z, alpha));
           projStore.element(base.add(3)).assign(vec42(adj, 1, 0, 0));
           keyAStore.element(i).assign(depthKey16(viewC.length(), uDepthMin, uDepthMax));
         });
@@ -15479,15 +15474,20 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
       });
       const a = vColor.w;
       const fall = z2.mul(-0.5).exp();
-      const alpha = a.mul(fall).toVar();
-      If(a.greaterThan(1), () => {
-        const expo = a.mul(a).sub(1).div(Math.E).exp();
-        alpha.assign(float2(1).sub(float2(1).sub(fall).pow(expo)));
-      });
+      const aLow = a.mul(fall);
+      const expo = a.mul(a).sub(1).div(Math.E).exp();
+      const aHigh = float2(1).sub(float2(1).sub(fall).pow(expo));
+      const alpha = select2(a.greaterThan(1), aHigh, aLow).toVar();
       If(alpha.lessThan(uMinAlpha.value), () => {
         Discard();
       });
-      return vec42(vColor.xyz, alpha);
+      const c = vColor.xyz.max(0);
+      const linear = select2(
+        c.lessThanEqual(0.04045),
+        c.div(12.92),
+        c.add(0.055).div(1.055).pow(2.4)
+      );
+      return vec42(linear, alpha);
     })();
     return material;
   }
