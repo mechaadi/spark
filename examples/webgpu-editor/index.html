@@ -452,7 +452,12 @@
     // GPU has actually finished, giving the honest ms-per-frame the vsync'd fps
     // hides (16.7ms = 60fps ceiling; anything above snaps to 30).
     const gpuDevice = renderer.backend?.device;
-    let gpuMsEMA = 0;
+    // Rolling-MIN over a ~1s window. onSubmittedWorkDone() resolves on a
+    // macrotask with noisy scheduling latency (occasional 200ms+ spikes), so an
+    // average is meaningless. Spikes only ever add time, so the window minimum
+    // is the cleanest estimate of true GPU frame cost and tracks toggles within
+    // ~1s. Shown as "min" so the number is trustworthy for A/B deltas.
+    const gpuWindow = new Array(64).fill(0);
     let gpuFrame = 0;
     renderer.setAnimationLoop(async () => {
       stats.begin();
@@ -467,11 +472,15 @@
         if (gpuDevice) await gpuDevice.queue.onSubmittedWorkDone();
       } catch {}
       const dt = performance.now() - t0;
-      gpuMsEMA = gpuMsEMA ? gpuMsEMA * 0.9 + dt * 0.1 : dt;
+      gpuWindow[gpuFrame % gpuWindow.length] = dt;
       if ((gpuFrame++ & 3) === 0) {
+        let mn = Infinity;
+        for (const t of gpuWindow) {
+          if (t > 0 && t < mn) mn = t;
+        }
         badge.textContent =
           `WebGPU\n${guiOptions.source}\n${guiOptions.splatCount} splats\n` +
-          `${gpuMsEMA.toFixed(1)} ms GPU`;
+          `${Number.isFinite(mn) ? mn.toFixed(1) : "—"} ms GPU (min)`;
       }
       stats.end();
     });
