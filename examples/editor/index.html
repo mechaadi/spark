@@ -138,7 +138,7 @@
 
     let instructions = null;
     const guiOptions = {
-      highDevicePixel: !isMobile(),
+      renderScale: 1.0,
       stats: false,
       resetOnLoad: true,
       loadOffset: 0,
@@ -487,14 +487,16 @@
         controls.pointerControls.reverseSwipe = value;
       });
 
-    function setHighDpi(value) {
-      renderer.setPixelRatio(value ? window.devicePixelRatio : 1);
+    // Render scale = absolute pixel ratio, capped at the display DPR. The main
+    // perf lever for fill-bound splat rendering; 1.0 is the sharp, fast default.
+    function setRenderScale(value) {
+      renderer.setPixelRatio(Math.min(value, window.devicePixelRatio));
       const width = canvas.clientWidth;
       const height = canvas.clientHeight;
       renderer.setSize(width, height, false);
       console.log("Render size", canvas.width, canvas.height);
     }
-    setHighDpi(guiOptions.highDevicePixel);
+    setRenderScale(guiOptions.renderScale);
 
     const splatExtra = {
       extSplats: true,
@@ -580,9 +582,10 @@
       updateFrameSplats();
     });
 
-    gui.add(guiOptions, "highDevicePixel").name("High DPI").onChange((value) => {
-      setHighDpi(value);
-    });
+    gui.add(guiOptions, "renderScale", 0.5, 2.0, 0.25).name("Render scale")
+      .onChange((value) => {
+        setRenderScale(value);
+      });
     gui.add(guiOptions, "stats").name("Show frame stats").onChange((value) => {
       stats.dom.style.display = value ? "block" : "none";
     });

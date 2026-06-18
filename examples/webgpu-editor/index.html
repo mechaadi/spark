@@ -202,11 +202,15 @@
     document.body.appendChild(stats.dom);
     stats.dom.style.display = "none";
 
-    let highDpi = true;
+    // Render scale = absolute pixel ratio. Fill-bound splat rendering scales
+    // with fragment count, so this is the biggest perf lever: 1.0 (~SuperSplat,
+    // sharp on retina) is the fast default; raise toward devicePixelRatio for
+    // full-res quality. Capped at the display DPR so we never supersample blindly.
+    let renderScale = 1.0;
     function handleResize() {
       const w = window.innerWidth;
       const h = window.innerHeight;
-      renderer.setPixelRatio(highDpi ? window.devicePixelRatio : 1);
+      renderer.setPixelRatio(Math.min(renderScale, window.devicePixelRatio));
       renderer.setSize(w, h, false);
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
@@ -305,7 +309,7 @@
       reversePointerDir: false,
       reversePointerSlide: false,
       autoRotate: false,
-      highDpi: true,
+      renderScale: 1.0,
       background: "#000000",
       gridOpacity: 0,
       showStats: false,
@@ -372,10 +376,13 @@
 
     // --- View ---
     const viewFolder = gui.addFolder("View");
-    viewFolder.add(guiOptions, "highDpi").name("High DPI").onChange((v) => {
-      highDpi = v;
-      handleResize();
-    });
+    viewFolder
+      .add(guiOptions, "renderScale", 0.5, 2.0, 0.25)
+      .name("Render scale")
+      .onChange((v) => {
+        renderScale = v;
+        handleResize();
+      });
     viewFolder.add(guiOptions, "showStats").name("Show frame stats").onChange((v) => {
       stats.dom.style.display = v ? "block" : "none";
     });
