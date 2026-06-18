@@ -14980,6 +14980,8 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
       Return,
       Loop,
       instanceIndex,
+      workgroupId,
+      atomicAdd,
       vec2: vec22,
       vec3: vec32,
       vec4: vec42,
@@ -15011,6 +15013,7 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
     const idxAStore = storage(sba(this.idxA), "uint", N);
     const idxBStore = storage(sba(this.idxB), "uint", N);
     const histStore = storage(sba(this.tileHist), "uint", histLen);
+    const histAtomic = storage(sba(this.tileHist), "uint", histLen).toAtomic();
     const baseStore = storage(sba(this.tileBase), "uint", histLen);
     const blockSumStore = storage(sba(this.blockSum), "uint", SCAN_BLOCKS);
     const blockBaseStore = storage(sba(this.blockBase), "uint", SCAN_BLOCKS);
@@ -15124,26 +15127,18 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
         });
       });
     });
+    const clearHist = Fn(() => {
+      const i = instanceIndex;
+      If(i.lessThan(uint2(histLen)), () => {
+        histStore.element(i).assign(uint2(0));
+      });
+    });
     const countKernel = (keyIn, shift) => Fn(() => {
-      const t = instanceIndex;
-      If(t.greaterThanEqual(uint2(numTiles)), () => {
-        Return();
-      });
-      const hist = tsl.array("uint", RADIX).toVar();
-      Loop(RADIX, ({ i }) => {
-        hist.element(uint2(i)).assign(uint2(0));
-      });
-      const start = t.mul(TILE);
-      Loop(TILE, ({ i }) => {
-        const e = start.add(i);
-        If(e.lessThan(N), () => {
-          const digit = keyIn.element(e).shiftRight(shift).bitAnd(RADIX - 1);
-          hist.element(digit).assign(hist.element(digit).add(1));
-        });
-      });
-      Loop(RADIX, ({ i }) => {
-        const d = uint2(i);
-        histStore.element(d.mul(numTiles).add(t)).assign(hist.element(d));
+      const e = instanceIndex;
+      If(e.lessThan(uint2(N)), () => {
+        const t = workgroupId.x;
+        const digit = keyIn.element(e).shiftRight(shift).bitAnd(RADIX - 1);
+        atomicAdd(histAtomic.element(digit.mul(numTiles).add(t)), uint2(1));
       });
     });
     const scanReduce = Fn(() => {
@@ -15214,7 +15209,8 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
     let outIdx = idxBStore;
     for (let p = 0; p < RADIX_PASSES; p++) {
       const shift = p * RADIX_BITS;
-      nodes.push(countKernel(inKey, shift)().compute(numTiles));
+      nodes.push(clearHist().compute(histLen));
+      nodes.push(countKernel(inKey, shift)().compute(N, [TILE]));
       nodes.push(scanReduce().compute(SCAN_BLOCKS));
       nodes.push(scanBlocks().compute(1));
       nodes.push(scanDown().compute(SCAN_BLOCKS));
