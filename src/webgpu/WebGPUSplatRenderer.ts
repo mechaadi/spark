@@ -447,9 +447,21 @@ export class WebGPUSplatRenderer extends THREE.Group {
           projStore
             .element(base.add(1))
             .assign(vec4(axis1.x, axis1.y, axis2.x, axis2.y));
+          // sRGB->linear EOTF, hoisted out of the fragment shader. Overdraw
+          // means each splat covers many fragments, so doing this once per
+          // splat here is far cheaper than 3 pow ops per covered pixel. The
+          // fragment then outputs the stored color straight; WebGPURenderer's
+          // output linear->sRGB OETF cancels it, so on-screen color is
+          // unchanged. (max(0) guards negative SH lobes, matching the WebGL path.)
+          const lin = rgb.max(0.0);
+          const rgbLin = select(
+            lin.lessThanEqual(0.04045),
+            lin.div(12.92),
+            lin.add(0.055).div(1.055).pow(2.4),
+          );
           projStore
             .element(base.add(2))
-            .assign(vec4(rgb.x, rgb.y, rgb.z, alpha));
+            .assign(vec4(rgbLin.x, rgbLin.y, rgbLin.z, alpha));
           projStore.element(base.add(3)).assign(vec4(adj, 1.0, 0.0, 0.0));
           // 16-bit far->near key, normalized to the model's view-depth range.
           keyAStore
@@ -557,22 +569,14 @@ export class WebGPUSplatRenderer extends THREE.Group {
       If(alpha.lessThan(uMinAlpha.value), () => {
         Discard();
       });
-      // The stored splat color is sRGB, but WebGPURenderer applies an output
-      // linear->sRGB (sRGB OETF) conversion to the fragment color. Apply the
-      // exact sRGB EOTF (sRGB->linear) here so the two cancel and the on-screen
-      // color equals the stored sRGB value, matching the WebGL path.
-      // max(0) guards against negative SH lobes.
-      const c = vColor.xyz.max(0.0);
-      const linear = select(
-        c.lessThanEqual(0.04045),
-        c.div(12.92),
-        c.add(0.055).div(1.055).pow(2.4),
-      );
+      // Color is already linear: the sRGB->linear EOTF now runs once per splat
+      // in the project pass (projStore), not per fragment, so we just output it
+      // straight here. WebGPURenderer's output linear->sRGB OETF cancels it.
       // Output STRAIGHT (non-premultiplied) color: NodeMaterial premultiplies it
       // itself when `premultipliedAlpha === true`. Outputting premultiplied here
       // would double-premultiply (rgb*alpha^2), darkening semi-transparent splats
       // to near nothing and leaving only opaque splats (a sparkle artifact).
-      return vec4(linear, alpha);
+      return vec4(vColor.xyz.max(0.0), alpha);
     })();
 
     return material;

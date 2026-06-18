@@ -15360,7 +15360,13 @@ class WebGPUSplatRenderer extends THREE.Group {
           const ndc = clip.xyz.div(clip.w);
           projStore.element(base).assign(vec42(ndc.x, ndc.y, clip.z, clip.w));
           projStore.element(base.add(1)).assign(vec42(axis1.x, axis1.y, axis2.x, axis2.y));
-          projStore.element(base.add(2)).assign(vec42(rgb.x, rgb.y, rgb.z, alpha));
+          const lin = rgb.max(0);
+          const rgbLin = select2(
+            lin.lessThanEqual(0.04045),
+            lin.div(12.92),
+            lin.add(0.055).div(1.055).pow(2.4)
+          );
+          projStore.element(base.add(2)).assign(vec42(rgbLin.x, rgbLin.y, rgbLin.z, alpha));
           projStore.element(base.add(3)).assign(vec42(adj, 1, 0, 0));
           keyAStore.element(i).assign(depthKey16(viewC.length(), uDepthMin, uDepthMax));
         });
@@ -15441,13 +15447,7 @@ class WebGPUSplatRenderer extends THREE.Group {
       If(alpha.lessThan(uMinAlpha.value), () => {
         Discard();
       });
-      const c = vColor.xyz.max(0);
-      const linear = select2(
-        c.lessThanEqual(0.04045),
-        c.div(12.92),
-        c.add(0.055).div(1.055).pow(2.4)
-      );
-      return vec42(linear, alpha);
+      return vec42(vColor.xyz.max(0), alpha);
     })();
     return material;
   }
