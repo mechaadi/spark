@@ -442,6 +442,17 @@ export class WebGPUSplatRenderer extends THREE.Group {
             rgb.assign(rgb.clamp(0.0, 1.0));
           }
 
+          // Convert sRGB->linear here, per splat, instead of per fragment: the
+          // raster is fill-bound when zoomed in, so 3 pow()s per fragment over
+          // huge overlapping splats dominate the frame. WebGPURenderer re-applies
+          // the linear->sRGB OETF on output, so the on-screen color is unchanged.
+          // (rgb is already in [0,1] — base color, or base+SH clamped above.)
+          const linRgb = select(
+            rgb.lessThanEqual(0.04045),
+            rgb.div(12.92),
+            rgb.add(0.055).div(1.055).pow(2.4),
+          );
+
           const ndc = clip.xyz.div(clip.w);
           projStore.element(base).assign(vec4(ndc.x, ndc.y, clip.z, clip.w));
           projStore
@@ -449,7 +460,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
             .assign(vec4(axis1.x, axis1.y, axis2.x, axis2.y));
           projStore
             .element(base.add(2))
-            .assign(vec4(rgb.x, rgb.y, rgb.z, alpha));
+            .assign(vec4(linRgb.x, linRgb.y, linRgb.z, alpha));
           projStore.element(base.add(3)).assign(vec4(adj, 1.0, 0.0, 0.0));
           // 16-bit far->near key, normalized to the model's view-depth range.
           keyAStore
@@ -550,29 +561,24 @@ export class WebGPUSplatRenderer extends THREE.Group {
       });
       const a = vColor.w;
       const fall = z2.mul(-0.5).exp();
-      const aLow = a.mul(fall);
-      const expo = a.mul(a).sub(1.0).div(Math.E).exp();
-      const aHigh = float(1.0).sub(float(1.0).sub(fall).pow(expo));
-      const alpha = select(a.greaterThan(1.0), aHigh, aLow).toVar();
+      // a<=1 is a plain Gaussian (one exp); a>1 (high-opacity / LOD-inflated)
+      // uses the bounded profile. Branch instead of select() so the common a<=1
+      // fragment skips the extra exp()+pow() — the raster is fill-bound, so per-
+      // fragment work over huge overlapping splats dominates. (a is per-splat, so
+      // the branch is coherent across a splat's fragments — no real divergence.)
+      const alpha = a.mul(fall).toVar();
+      If(a.greaterThan(1.0), () => {
+        const expo = a.mul(a).sub(1.0).div(Math.E).exp();
+        alpha.assign(float(1.0).sub(float(1.0).sub(fall).pow(expo)));
+      });
       If(alpha.lessThan(uMinAlpha.value), () => {
         Discard();
       });
-      // The stored splat color is sRGB, but WebGPURenderer applies an output
-      // linear->sRGB (sRGB OETF) conversion to the fragment color. Apply the
-      // exact sRGB EOTF (sRGB->linear) here so the two cancel and the on-screen
-      // color equals the stored sRGB value, matching the WebGL path.
-      // max(0) guards against negative SH lobes.
-      const c = vColor.xyz.max(0.0);
-      const linear = select(
-        c.lessThanEqual(0.04045),
-        c.div(12.92),
-        c.add(0.055).div(1.055).pow(2.4),
-      );
-      // Output STRAIGHT (non-premultiplied) color: NodeMaterial premultiplies it
-      // itself when `premultipliedAlpha === true`. Outputting premultiplied here
-      // would double-premultiply (rgb*alpha^2), darkening semi-transparent splats
-      // to near nothing and leaving only opaque splats (a sparkle artifact).
-      return vec4(linear, alpha);
+      // Color is already linear (sRGB->linear is done once per splat in project,
+      // not per fragment). Output STRAIGHT (non-premultiplied): NodeMaterial
+      // premultiplies itself when premultipliedAlpha === true; premultiplying here
+      // too would double it (rgb*alpha^2) and darken semi-transparent splats.
+      return vec4(vColor.xyz, alpha);
     })();
 
     return material;
