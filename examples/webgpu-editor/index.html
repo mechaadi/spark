@@ -114,12 +114,15 @@
     const badge = document.getElementById("badge");
 
     // The WebGPU editor only runs on the compute backend; there is no WebGL2
-    // fallback *on this page* (that's what ../editor/ is). Detect up front so we
-    // show a helpful message instead of a black screen.
-    if (!isWebGPUAvailable()) {
+    // fallback *on this page* (that's what ../editor/ is). Show a helpful message
+    // instead of a black screen / a WGSL-on-WebGL parser crash.
+    function showUnsupported() {
       document.getElementById("unsupported").style.display = "flex";
       document.getElementById("gui").style.display = "none";
       badge.style.display = "none";
+    }
+    if (!isWebGPUAvailable()) {
+      showUnsupported();
       throw new Error("WebGPU unavailable");
     }
 
@@ -130,6 +133,14 @@
     const requiredLimits = (await requestWebGPUStorageLimits()) ?? {};
     const renderer = new WebGPURenderer({ canvas, antialias: false, requiredLimits });
     await renderer.init();
+    // WebGPURenderer silently falls back to its WebGL2 backend when a WebGPU
+    // device can't be acquired (passes isWebGPUAvailable but the adapter/device
+    // fails). The WGSL splat path can't run on WebGL — it crashes in the GLSL
+    // node parser — so bail to the unsupported message instead.
+    if (renderer.backend?.isWebGPUBackend !== true) {
+      showUnsupported();
+      throw new Error("WebGPU device unavailable (renderer fell back to WebGL2)");
+    }
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color("#000000");
