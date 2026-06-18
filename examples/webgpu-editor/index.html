@@ -146,8 +146,10 @@
     // reverse-pointer options). Only one drives the camera per frame.
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.target.set(0, 0, 0);
-    controls.enableDamping = true;
-    controls.minDistance = 0.2;
+    // No damping — match the WebGL editor's 1:1 snappy drag (damping eases
+    // rotation over many frames, which feels sluggish, more so at lower fps).
+    controls.enableDamping = false;
+    controls.minDistance = 0.1;
     controls.maxDistance = 50;
 
     const sparkControls = new SparkControls({ canvas });
