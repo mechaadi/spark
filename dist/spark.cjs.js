@@ -14674,6 +14674,311 @@ let SparkRenderer = _SparkRenderer;
 function checkIsXRRenderTarget(renderTarget) {
   return renderTarget == null ? void 0 : renderTarget.isXRRenderTarget;
 }
+const TILE = 256;
+const RADIX = 256;
+const RADIX_PASSES = 2;
+const SCAN_BLOCKS = 1024;
+const COUNT_WGSL = (shift) => (
+  /* wgsl */
+  `
+@group(0) @binding(0) var<storage, read> keyIn : array<u32>;
+@group(0) @binding(1) var<storage, read_write> hist : array<u32>;
+@group(0) @binding(2) var<uniform> params : vec2<u32>; // x=N, y=numTiles
+
+var<workgroup> lhist : array<atomic<u32>, ${RADIX}>;
+
+@compute @workgroup_size(${TILE})
+fn main(@builtin(global_invocation_id) gid : vec3<u32>,
+        @builtin(local_invocation_index) lid : u32,
+        @builtin(workgroup_id) wid : vec3<u32>) {
+  atomicStore(&lhist[lid], 0u);
+  workgroupBarrier();
+  let e = gid.x;
+  if (e < params.x) {
+    let d = (keyIn[e] >> ${shift}u) & ${RADIX - 1}u;
+    atomicAdd(&lhist[d], 1u);
+  }
+  workgroupBarrier();
+  // digit-major: hist[digit * numTiles + tile]; each (digit,tile) written once.
+  hist[lid * params.y + wid.x] = atomicLoad(&lhist[lid]);
+}
+`
+);
+const SCAN_REDUCE_WGSL = (
+  /* wgsl */
+  `
+@group(0) @binding(0) var<storage, read> hist : array<u32>;
+@group(0) @binding(1) var<storage, read_write> blockSum : array<u32>;
+@group(0) @binding(2) var<uniform> sp : vec2<u32>; // x=histLen, y=blockSize
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let b = gid.x;
+  if (b >= ${SCAN_BLOCKS}u) { return; }
+  let start = b * sp.y;
+  var sum = 0u;
+  for (var i = 0u; i < sp.y; i = i + 1u) {
+    let e = start + i;
+    if (e < sp.x) { sum = sum + hist[e]; }
+  }
+  blockSum[b] = sum;
+}
+`
+);
+const SCAN_BLOCKS_WGSL = (
+  /* wgsl */
+  `
+@group(0) @binding(0) var<storage, read> blockSum : array<u32>;
+@group(0) @binding(1) var<storage, read_write> blockBase : array<u32>;
+
+@compute @workgroup_size(1)
+fn main() {
+  var running = 0u;
+  for (var i = 0u; i < ${SCAN_BLOCKS}u; i = i + 1u) {
+    blockBase[i] = running;
+    running = running + blockSum[i];
+  }
+}
+`
+);
+const SCAN_DOWN_WGSL = (
+  /* wgsl */
+  `
+@group(0) @binding(0) var<storage, read> hist : array<u32>;
+@group(0) @binding(1) var<storage, read> blockBase : array<u32>;
+@group(0) @binding(2) var<storage, read_write> base : array<u32>;
+@group(0) @binding(3) var<uniform> sp : vec2<u32>; // x=histLen, y=blockSize
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let b = gid.x;
+  if (b >= ${SCAN_BLOCKS}u) { return; }
+  let start = b * sp.y;
+  var running = blockBase[b];
+  for (var i = 0u; i < sp.y; i = i + 1u) {
+    let e = start + i;
+    if (e < sp.x) {
+      base[e] = running;
+      running = running + hist[e];
+    }
+  }
+}
+`
+);
+const SCATTER_WGSL = (shift) => (
+  /* wgsl */
+  `
+@group(0) @binding(0) var<storage, read> keyIn : array<u32>;
+@group(0) @binding(1) var<storage, read> idxIn : array<u32>;
+@group(0) @binding(2) var<storage, read> base : array<u32>;
+@group(0) @binding(3) var<storage, read_write> keyOut : array<u32>;
+@group(0) @binding(4) var<storage, read_write> idxOut : array<u32>;
+@group(0) @binding(5) var<uniform> params : vec2<u32>; // x=N, y=numTiles
+
+var<workgroup> soffset : array<u32, ${RADIX}>;
+
+@compute @workgroup_size(${TILE})
+fn main(@builtin(local_invocation_index) lid : u32,
+        @builtin(workgroup_id) wid : vec3<u32>) {
+  let N = params.x;
+  let numTiles = params.y;
+  // Each digit's global start for this tile (parallel load across the workgroup).
+  soffset[lid] = base[lid * numTiles + wid.x];
+  workgroupBarrier();
+  // Stable placement: emit this tile's elements in order. Serial within the
+  // tile (one thread) keeps equal-depth draw order deterministic == no flicker.
+  if (lid == 0u) {
+    let start = wid.x * ${TILE}u;
+    for (var j = 0u; j < ${TILE}u; j = j + 1u) {
+      let e = start + j;
+      if (e < N) {
+        let key = keyIn[e];
+        let d = (key >> ${shift}u) & ${RADIX - 1}u;
+        let pos = soffset[d];
+        soffset[d] = pos + 1u;
+        keyOut[pos] = key;
+        idxOut[pos] = idxIn[e];
+      }
+    }
+  }
+}
+`
+);
+const STORAGE = 128;
+const UNIFORM = 64;
+const COPY_DST = 8;
+class RawRadixSort {
+  // biome-ignore lint/suspicious/noExplicitAny: THREE GPUDevice is untyped here.
+  constructor(device) {
+    this.n = 0;
+    this.numTiles = 0;
+    this.histLen = 0;
+    this.keyB = null;
+    this.idxB = null;
+    this.hist = null;
+    this.base = null;
+    this.blockSum = null;
+    this.blockBase = null;
+    this.paramsBuf = null;
+    this.scanParamsBuf = null;
+    this.countPipe = [];
+    this.scatterPipe = [];
+    this.scanReducePipe = null;
+    this.scanBlocksPipe = null;
+    this.scanDownPipe = null;
+    this.groups = null;
+    this.device = device;
+  }
+  /** (Re)allocate scratch + pipelines for a splat count. Call on setSplatMesh. */
+  configure(numSplats) {
+    this.dispose();
+    this.n = numSplats;
+    this.numTiles = Math.ceil(numSplats / TILE);
+    this.histLen = this.numTiles * RADIX;
+    const blockSize = Math.ceil(this.histLen / SCAN_BLOCKS);
+    const d = this.device;
+    const buf = (bytes, usage) => d.createBuffer({ size: Math.max(4, bytes), usage });
+    this.keyB = buf(numSplats * 4, STORAGE);
+    this.idxB = buf(numSplats * 4, STORAGE);
+    this.hist = buf(this.histLen * 4, STORAGE);
+    this.base = buf(this.histLen * 4, STORAGE);
+    this.blockSum = buf(SCAN_BLOCKS * 4, STORAGE);
+    this.blockBase = buf(SCAN_BLOCKS * 4, STORAGE);
+    this.paramsBuf = buf(8, UNIFORM | COPY_DST);
+    this.scanParamsBuf = buf(8, UNIFORM | COPY_DST);
+    d.queue.writeBuffer(
+      this.paramsBuf,
+      0,
+      new Uint32Array([this.n, this.numTiles])
+    );
+    d.queue.writeBuffer(
+      this.scanParamsBuf,
+      0,
+      new Uint32Array([this.histLen, blockSize])
+    );
+    const pipe = (code) => d.createComputePipeline({
+      layout: "auto",
+      compute: { module: d.createShaderModule({ code }), entryPoint: "main" }
+    });
+    this.countPipe = [pipe(COUNT_WGSL(0)), pipe(COUNT_WGSL(8))];
+    this.scatterPipe = [pipe(SCATTER_WGSL(0)), pipe(SCATTER_WGSL(8))];
+    this.scanReducePipe = pipe(SCAN_REDUCE_WGSL);
+    this.scanBlocksPipe = pipe(SCAN_BLOCKS_WGSL);
+    this.scanDownPipe = pipe(SCAN_DOWN_WGSL);
+    this.groups = null;
+  }
+  /**
+   * Bind the external (THREE-owned) key + index buffers. `keyA`/`idxA` hold the
+   * depth key + identity payload from the project pass and receive the sorted
+   * result (even pass count). Rebuilds bind groups.
+   */
+  bindIO(keyA, idxA) {
+    const d = this.device;
+    const bg = (pipe, entries) => d.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries });
+    const b = (binding, buffer) => ({
+      binding,
+      resource: { buffer }
+    });
+    const keyB = this.keyB;
+    const idxB = this.idxB;
+    const hist = this.hist;
+    const base = this.base;
+    const params = this.paramsBuf;
+    this.groups = {
+      count: [
+        bg(this.countPipe[0], [b(0, keyA), b(1, hist), b(2, params)]),
+        bg(this.countPipe[1], [b(0, keyB), b(1, hist), b(2, params)])
+      ],
+      scatter: [
+        bg(this.scatterPipe[0], [
+          b(0, keyA),
+          b(1, idxA),
+          b(2, base),
+          b(3, keyB),
+          b(4, idxB),
+          b(5, params)
+        ]),
+        bg(this.scatterPipe[1], [
+          b(0, keyB),
+          b(1, idxB),
+          b(2, base),
+          b(3, keyA),
+          b(4, idxA),
+          b(5, params)
+        ])
+      ],
+      scanReduce: bg(this.scanReducePipe, [
+        b(0, hist),
+        b(1, this.blockSum),
+        b(2, this.scanParamsBuf)
+      ]),
+      scanBlocks: bg(this.scanBlocksPipe, [
+        b(0, this.blockSum),
+        b(1, this.blockBase)
+      ]),
+      scanDown: bg(this.scanDownPipe, [
+        b(0, hist),
+        b(1, this.blockBase),
+        b(2, base),
+        b(3, this.scanParamsBuf)
+      ])
+    };
+  }
+  /** Record + submit the whole sort as one command buffer. */
+  run() {
+    if (!this.groups || this.n === 0) {
+      return;
+    }
+    const d = this.device;
+    const enc = d.createCommandEncoder();
+    const tiles = this.numTiles;
+    for (let p = 0; p < RADIX_PASSES; p++) {
+      const pass = enc.beginComputePass();
+      pass.setPipeline(this.countPipe[p]);
+      pass.setBindGroup(0, this.groups.count[p]);
+      pass.dispatchWorkgroups(tiles);
+      pass.end();
+      const sr = enc.beginComputePass();
+      sr.setPipeline(this.scanReducePipe);
+      sr.setBindGroup(0, this.groups.scanReduce);
+      sr.dispatchWorkgroups(Math.ceil(SCAN_BLOCKS / 64));
+      sr.end();
+      const sb = enc.beginComputePass();
+      sb.setPipeline(this.scanBlocksPipe);
+      sb.setBindGroup(0, this.groups.scanBlocks);
+      sb.dispatchWorkgroups(1);
+      sb.end();
+      const sd = enc.beginComputePass();
+      sd.setPipeline(this.scanDownPipe);
+      sd.setBindGroup(0, this.groups.scanDown);
+      sd.dispatchWorkgroups(Math.ceil(SCAN_BLOCKS / 64));
+      sd.end();
+      const sc = enc.beginComputePass();
+      sc.setPipeline(this.scatterPipe[p]);
+      sc.setBindGroup(0, this.groups.scatter[p]);
+      sc.dispatchWorkgroups(tiles);
+      sc.end();
+    }
+    d.queue.submit([enc.finish()]);
+  }
+  dispose() {
+    for (const b of [
+      this.keyB,
+      this.idxB,
+      this.hist,
+      this.base,
+      this.blockSum,
+      this.blockBase,
+      this.paramsBuf,
+      this.scanParamsBuf
+    ]) {
+      b == null ? void 0 : b.destroy();
+    }
+    this.keyB = this.idxB = this.hist = this.base = null;
+    this.blockSum = this.blockBase = this.paramsBuf = this.scanParamsBuf = null;
+    this.groups = null;
+  }
+}
 const WGSL_UNPACK_CENTER = (
   /* wgsl */
   `
@@ -14827,11 +15132,6 @@ fn sparkDepthKey16( dist : f32, minDist : f32, maxDist : f32 ) -> u32 {
 }
 `
 );
-const TILE = 256;
-const RADIX_BITS = 8;
-const RADIX = 1 << RADIX_BITS;
-const RADIX_PASSES = 2;
-const SCAN_BLOCKS = 1024;
 class WebGPUSplatRenderer extends THREE__namespace.Group {
   constructor(options) {
     super();
@@ -14843,19 +15143,15 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
     this.packedAttr = null;
     this.projAttr = null;
     this.keyA = null;
-    this.keyB = null;
     this.idxA = null;
-    this.idxB = null;
-    this.tileHist = null;
-    this.tileBase = null;
-    this.blockSum = null;
-    this.blockBase = null;
     this.sh1Attr = null;
     this.sh2Attr = null;
     this.sh3Attr = null;
     this.numSh = 0;
     this.shMax = new THREE__namespace.Vector3(1, 1, 1);
     this.computeNodes = [];
+    this.rawSort = null;
+    this.rawSortBound = false;
     this.uModelView = null;
     this.uModelView3 = null;
     this.uProjection = null;
@@ -14926,8 +15222,6 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
     box.getCenter(this.boundCenter);
     this.boundRadius = box.getSize(this.tmpSphere).length() * 0.5;
     const packedArray = packed.packedArray.subarray(0, numSplats * 4);
-    const numTiles = Math.ceil(numSplats / TILE);
-    const histLen = numTiles * RADIX;
     const { StorageBufferAttribute, MeshBasicNodeMaterial } = this.wgpu;
     this.packedAttr = new StorageBufferAttribute(
       packedArray.slice(),
@@ -14938,16 +15232,7 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
       4
     );
     this.keyA = new StorageBufferAttribute(new Uint32Array(numSplats), 1);
-    this.keyB = new StorageBufferAttribute(new Uint32Array(numSplats), 1);
     this.idxA = new StorageBufferAttribute(new Uint32Array(numSplats), 1);
-    this.idxB = new StorageBufferAttribute(new Uint32Array(numSplats), 1);
-    this.tileHist = new StorageBufferAttribute(new Uint32Array(histLen), 1);
-    this.tileBase = new StorageBufferAttribute(new Uint32Array(histLen), 1);
-    this.blockSum = new StorageBufferAttribute(new Uint32Array(SCAN_BLOCKS), 1);
-    this.blockBase = new StorageBufferAttribute(
-      new Uint32Array(SCAN_BLOCKS),
-      1
-    );
     const extra = packed.extra;
     const enc = packed.splatEncoding ?? {};
     this.shMax.set(enc.sh1Max ?? 1, enc.sh2Max ?? 1, enc.sh3Max ?? 1);
@@ -14968,7 +15253,7 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
         }
       }
     }
-    this.buildPipeline(numTiles);
+    this.buildPipeline();
     const material = this.buildMaterial(MeshBasicNodeMaterial);
     const geometry = makeQuadGeometry(numSplats);
     const drawMesh = new THREE__namespace.Mesh(geometry, material);
@@ -14976,13 +15261,13 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
     this.mesh = drawMesh;
     this.add(drawMesh);
   }
-  buildPipeline(numTiles) {
+  buildPipeline() {
+    var _a2;
     const tsl = this.tsl;
     const {
       Fn,
       If,
       Return,
-      Loop,
       instanceIndex,
       vec2: vec22,
       vec3: vec32,
@@ -14999,8 +15284,6 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
       sqrt: sqrt2
     } = tsl;
     const N = this.numSplats;
-    const histLen = numTiles * RADIX;
-    const scanBlockSize = Math.ceil(histLen / SCAN_BLOCKS);
     const unpackCenter = wgslFn(WGSL_UNPACK_CENTER);
     const unpackRgba = wgslFn(WGSL_UNPACK_RGBA);
     const unpackScales = wgslFn(WGSL_UNPACK_SCALES);
@@ -15011,13 +15294,7 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
     const packedStore = storage(sba(this.packedAttr), "uvec4", N).toReadOnly();
     const projStore = storage(sba(this.projAttr), "vec4", N * 4);
     const keyAStore = storage(sba(this.keyA), "uint", N);
-    const keyBStore = storage(sba(this.keyB), "uint", N);
     const idxAStore = storage(sba(this.idxA), "uint", N);
-    const idxBStore = storage(sba(this.idxB), "uint", N);
-    const histStore = storage(sba(this.tileHist), "uint", histLen);
-    const baseStore = storage(sba(this.tileBase), "uint", histLen);
-    const blockSumStore = storage(sba(this.blockSum), "uint", SCAN_BLOCKS);
-    const blockBaseStore = storage(sba(this.blockBase), "uint", SCAN_BLOCKS);
     const uModelView = uniform2(new THREE__namespace.Matrix4());
     const uModelView3 = uniform2(new THREE__namespace.Matrix3());
     const uProjection = uniform2(new THREE__namespace.Matrix4());
@@ -15128,107 +15405,13 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
         });
       });
     });
-    const countKernel = (keyIn, shift) => Fn(() => {
-      const t = instanceIndex;
-      If(t.greaterThanEqual(uint2(numTiles)), () => {
-        Return();
-      });
-      const hist = tsl.array("uint", RADIX).toVar();
-      Loop(RADIX, ({ i }) => {
-        hist.element(uint2(i)).assign(uint2(0));
-      });
-      const start = t.mul(TILE);
-      Loop(TILE, ({ i }) => {
-        const e = start.add(i);
-        If(e.lessThan(N), () => {
-          const digit = keyIn.element(e).shiftRight(shift).bitAnd(RADIX - 1);
-          hist.element(digit).assign(hist.element(digit).add(1));
-        });
-      });
-      Loop(RADIX, ({ i }) => {
-        const d = uint2(i);
-        histStore.element(d.mul(numTiles).add(t)).assign(hist.element(d));
-      });
-    });
-    const scanReduce = Fn(() => {
-      If(instanceIndex.greaterThanEqual(uint2(SCAN_BLOCKS)), () => {
-        Return();
-      });
-      const start = instanceIndex.mul(scanBlockSize);
-      const sum = uint2(0).toVar();
-      Loop(scanBlockSize, ({ i }) => {
-        const e = start.add(i);
-        If(e.lessThan(histLen), () => {
-          sum.assign(sum.add(histStore.element(e)));
-        });
-      });
-      blockSumStore.element(instanceIndex).assign(sum);
-    });
-    const scanBlocks = Fn(() => {
-      If(instanceIndex.greaterThanEqual(uint2(1)), () => {
-        Return();
-      });
-      const running = uint2(0).toVar();
-      Loop(SCAN_BLOCKS, ({ i }) => {
-        blockBaseStore.element(uint2(i)).assign(running);
-        running.assign(running.add(blockSumStore.element(uint2(i))));
-      });
-    });
-    const scanDown = Fn(() => {
-      If(instanceIndex.greaterThanEqual(uint2(SCAN_BLOCKS)), () => {
-        Return();
-      });
-      const start = instanceIndex.mul(scanBlockSize);
-      const running = blockBaseStore.element(instanceIndex).toVar();
-      Loop(scanBlockSize, ({ i }) => {
-        const e = start.add(i);
-        If(e.lessThan(histLen), () => {
-          baseStore.element(e).assign(running);
-          running.assign(running.add(histStore.element(e)));
-        });
-      });
-    });
-    const scatterKernel = (keyIn, idxIn, keyOut, idxOut, shift) => Fn(() => {
-      const t = instanceIndex;
-      If(t.greaterThanEqual(uint2(numTiles)), () => {
-        Return();
-      });
-      const offset = tsl.array("uint", RADIX).toVar();
-      Loop(RADIX, ({ i }) => {
-        const d = uint2(i);
-        offset.element(d).assign(baseStore.element(d.mul(numTiles).add(t)));
-      });
-      const start = t.mul(TILE);
-      Loop(TILE, ({ i }) => {
-        const e = start.add(i);
-        If(e.lessThan(N), () => {
-          const key = keyIn.element(e);
-          const digit = key.shiftRight(shift).bitAnd(RADIX - 1);
-          const pos = offset.element(digit).toVar();
-          keyOut.element(pos).assign(key);
-          idxOut.element(pos).assign(idxIn.element(e));
-          offset.element(digit).assign(pos.add(1));
-        });
-      });
-    });
-    const nodes = [project().compute(N)];
-    let inKey = keyAStore;
-    let inIdx = idxAStore;
-    let outKey = keyBStore;
-    let outIdx = idxBStore;
-    for (let p = 0; p < RADIX_PASSES; p++) {
-      const shift = p * RADIX_BITS;
-      nodes.push(countKernel(inKey, shift)().compute(numTiles));
-      nodes.push(scanReduce().compute(SCAN_BLOCKS));
-      nodes.push(scanBlocks().compute(1));
-      nodes.push(scanDown().compute(SCAN_BLOCKS));
-      nodes.push(
-        scatterKernel(inKey, inIdx, outKey, outIdx, shift)().compute(numTiles)
-      );
-      [inKey, outKey] = [outKey, inKey];
-      [inIdx, outIdx] = [outIdx, inIdx];
+    this.computeNodes = [project().compute(N)];
+    const device = (_a2 = this.renderer.backend) == null ? void 0 : _a2.device;
+    if (device) {
+      this.rawSort = new RawRadixSort(device);
+      this.rawSort.configure(N);
+      this.rawSortBound = false;
     }
-    this.computeNodes = nodes;
   }
   buildMaterial(MeshBasicNodeMaterial) {
     const tsl = this.tsl;
@@ -15312,6 +15495,7 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
    * radix sort). Call before rendering the scene. No GPU->CPU readback.
    */
   prepareFrame(camera) {
+    var _a2, _b2;
     if (!this.mesh || !this.numSplats) {
       return;
     }
@@ -15359,6 +15543,20 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
     for (const node of this.computeNodes) {
       this.renderer.compute(node);
     }
+    if (this.rawSort) {
+      if (!this.rawSortBound) {
+        const backend = this.renderer.backend;
+        const keyBuf = (_a2 = backend == null ? void 0 : backend.get(this.keyA)) == null ? void 0 : _a2.buffer;
+        const idxBuf = (_b2 = backend == null ? void 0 : backend.get(this.idxA)) == null ? void 0 : _b2.buffer;
+        if (keyBuf && idxBuf) {
+          this.rawSort.bindIO(keyBuf, idxBuf);
+          this.rawSortBound = true;
+        }
+      }
+      if (this.rawSortBound) {
+        this.rawSort.run();
+      }
+    }
   }
   /** Convenience: prepareFrame + renderer.renderAsync. */
   async renderFrame(scene, camera) {
@@ -15366,6 +15564,7 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
     await this.renderer.renderAsync(scene, camera);
   }
   disposeMesh() {
+    var _a2;
     if (this.mesh) {
       this.remove(this.mesh);
       this.mesh.geometry.dispose();
@@ -15373,19 +15572,20 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
       this.mesh = null;
     }
     this.computeNodes = [];
+    (_a2 = this.rawSort) == null ? void 0 : _a2.dispose();
+    this.rawSort = null;
+    this.rawSortBound = false;
   }
   dispose() {
+    var _a2;
     this.disposeMesh();
+    (_a2 = this.rawSort) == null ? void 0 : _a2.dispose();
+    this.rawSort = null;
+    this.rawSortBound = false;
     this.packedAttr = null;
     this.projAttr = null;
     this.keyA = null;
-    this.keyB = null;
     this.idxA = null;
-    this.idxB = null;
-    this.tileHist = null;
-    this.tileBase = null;
-    this.blockSum = null;
-    this.blockBase = null;
     this.sh1Attr = null;
     this.sh2Attr = null;
     this.sh3Attr = null;
