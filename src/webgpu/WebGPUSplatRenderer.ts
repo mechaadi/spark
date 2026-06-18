@@ -141,6 +141,12 @@ export class WebGPUSplatRenderer extends THREE.Group {
   maxPixelRadius = 512.0;
   /** Evaluate SH color (read on the next `setSplatMesh`). */
   enableSh = true;
+  /**
+   * Debug: skip the depth sort and render in the project pass's identity order.
+   * The result is wrong (no painter's order), but A/B-ing fps with this on/off
+   * isolates how much of the frame the sort actually costs vs project + raster.
+   */
+  skipSort = false;
 
   constructor(options: WebGPUSplatRendererOptions) {
     super();
@@ -654,7 +660,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
           this.rawSortBound = true;
         }
       }
-      if (this.rawSortBound) {
+      if (this.rawSortBound && !this.skipSort) {
         this.rawSort.run();
       }
     }

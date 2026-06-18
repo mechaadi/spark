@@ -93,6 +93,12 @@ export declare class WebGPUSplatRenderer extends THREE.Group {
     maxPixelRadius: number;
     /** Evaluate SH color (read on the next `setSplatMesh`). */
     enableSh: boolean;
+    /**
+     * Debug: skip the depth sort and render in the project pass's identity order.
+     * The result is wrong (no painter's order), but A/B-ing fps with this on/off
+     * isolates how much of the frame the sort actually costs vs project + raster.
+     */
+    skipSort: boolean;
     constructor(options: WebGPUSplatRendererOptions);
     /** Dynamically load the WebGPU/TSL modules. Idempotent. */
     init(): Promise<this>;

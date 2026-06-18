@@ -151,6 +151,9 @@
     const spark = new WebGPUSplatRenderer({ renderer, enableSh: true });
     await spark.init();
     scene.add(spark);
+    // Debug: ?nosort skips the depth sort (renders wrong, but isolates sort cost
+    // for an fps A/B). Also toggleable live in the Splat rendering panel.
+    spark.skipSort = new URLSearchParams(location.search).has("nosort");
 
     // Two camera control schemes, toggled in the GUI: OrbitControls (orbit a
     // target) and Spark's pointer/fly controls (SparkControls, which exposes the
@@ -402,6 +405,7 @@
     renderFolder.add(spark, "maxStdDev", 0.5, 4, 0.01).name("Max Gsplat stddev").listen();
     renderFolder.add(spark, "minAlpha", 0, 0.1, 0.0005).name("Min alpha").listen();
     renderFolder.add(spark, "maxPixelRadius", 16, 1024, 1).name("Max pixel radius").listen();
+    renderFolder.add(spark, "skipSort").name("Skip sort (debug)").listen();
     // Drag below 1 to cull oversized floater splats (fraction of model size).
     renderFolder.add(guiOptions, "trimFloaters", 0.002, 1, 0.002)
       .name("Max splat size").listen().onChange(applyTrimFloaters);

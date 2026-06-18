@@ -15139,6 +15139,7 @@ class WebGPUSplatRenderer extends THREE.Group {
     this.minAlpha = 0.5 * (1 / 255);
     this.maxPixelRadius = 512;
     this.enableSh = true;
+    this.skipSort = false;
     if (!(options == null ? void 0 : options.renderer)) {
       throw new Error("WebGPUSplatRenderer requires a THREE.WebGPURenderer");
     }
@@ -15513,7 +15514,7 @@ class WebGPUSplatRenderer extends THREE.Group {
           this.rawSortBound = true;
         }
       }
-      if (this.rawSortBound) {
+      if (this.rawSortBound && !this.skipSort) {
         this.rawSort.run();
       }
     }
