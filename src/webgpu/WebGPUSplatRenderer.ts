@@ -18,10 +18,10 @@ import {
 // the model's depth extent; see WGSL_DEPTH_KEY16), 2 passes of 8 bits. A
 // *stable* sort is required: the draw order of splats within the same quantized
 // depth must be deterministic frame to frame, otherwise alpha blending of
-// overlapping splats flickers. Each tile
-// owns a disjoint span of TILE elements and writes to a disjoint output range,
-// so count/scatter need no atomics, and the only inter-dispatch dependencies
-// are dispatched as separate (synchronized) passes.
+// overlapping splats flickers. The count is cooperative (one thread per splat,
+// atomicAdd into a global per-tile histogram); the stable scatter stays per-tile
+// (each tile owns a disjoint output range, no atomics). Inter-dispatch
+// dependencies are run as separate (synchronized) passes.
 const TILE = 256; // elements per tile
 const RADIX_BITS = 8;
 const RADIX = 1 << RADIX_BITS; // 256 buckets / digit
@@ -283,6 +283,8 @@ export class WebGPUSplatRenderer extends THREE.Group {
       Return,
       Loop,
       instanceIndex,
+      workgroupId,
+      atomicAdd,
       vec2,
       vec3,
       vec4,
@@ -317,6 +319,10 @@ export class WebGPUSplatRenderer extends THREE.Group {
     const idxAStore = storage(sba(this.idxA), "uint", N);
     const idxBStore = storage(sba(this.idxB), "uint", N);
     const histStore = storage(sba(this.tileHist), "uint", histLen);
+    // Atomic view of the same histogram buffer, for the cooperative count pass
+    // (one thread per splat accumulating into global memory). The scan reads the
+    // non-atomic `histStore` view in a later, synchronized pass.
+    const histAtomic = storage(sba(this.tileHist), "uint", histLen).toAtomic();
     const baseStore = storage(sba(this.tileBase), "uint", histLen);
     const blockSumStore = storage(sba(this.blockSum), "uint", SCAN_BLOCKS);
     const blockBaseStore = storage(sba(this.blockBase), "uint", SCAN_BLOCKS);
@@ -481,34 +487,31 @@ export class WebGPUSplatRenderer extends THREE.Group {
       });
     });
 
-    // --- Stable tiled radix sort (one tile per invocation, no atomics) ---
-    // count: per-tile histogram of the current 8-bit digit, written digit-major
-    // (digit * numTiles + tile) so a single prefix sum over the whole array
-    // gives each (digit, tile)'s global base offset.
+    // --- Stable tiled radix sort ---
+    // count (cooperative): one thread per splat accumulates the per-tile digit
+    // histogram directly in global memory via atomicAdd. Workgroup size == TILE,
+    // so workgroupId == tile index, and the layout (digit * numTiles + tile) is
+    // bit-identical to the old serial count — scan + stable scatter are
+    // unchanged. (TSL has no workgroup-shared atomics, so the accumulator is the
+    // global buffer; the histogram must be zeroed first.) This replaces the old
+    // ~numTiles serial threads (each looping TILE with a 256-entry private array)
+    // with N parallel threads.
+    const clearHist = Fn(() => {
+      const i = instanceIndex;
+      If(i.lessThan(uint(histLen)), () => {
+        histStore.element(i).assign(uint(0));
+      });
+    });
     const countKernel = (keyIn: typeof keyAStore, shift: number) =>
       Fn(() => {
-        const t = instanceIndex;
-        If(t.greaterThanEqual(uint(numTiles)), () => {
-          Return();
-        });
-        const hist = tsl.array("uint", RADIX).toVar();
-        Loop(RADIX, ({ i }) => {
-          hist.element(uint(i)).assign(uint(0));
-        });
-        const start = t.mul(TILE);
-        Loop(TILE, ({ i }) => {
-          const e = start.add(i);
-          If(e.lessThan(N), () => {
-            const digit = keyIn
-              .element(e)
-              .shiftRight(shift)
-              .bitAnd(RADIX - 1);
-            hist.element(digit).assign(hist.element(digit).add(1));
-          });
-        });
-        Loop(RADIX, ({ i }) => {
-          const d = uint(i);
-          histStore.element(d.mul(numTiles).add(t)).assign(hist.element(d));
+        const e = instanceIndex;
+        If(e.lessThan(uint(N)), () => {
+          const t = workgroupId.x; // workgroup size == TILE -> tile index
+          const digit = keyIn
+            .element(e)
+            .shiftRight(shift)
+            .bitAnd(RADIX - 1);
+          atomicAdd(histAtomic.element(digit.mul(numTiles).add(t)), uint(1));
         });
       });
 
@@ -600,7 +603,10 @@ export class WebGPUSplatRenderer extends THREE.Group {
     let outIdx = idxBStore;
     for (let p = 0; p < RADIX_PASSES; p++) {
       const shift = p * RADIX_BITS;
-      nodes.push(countKernel(inKey, shift)().compute(numTiles));
+      // Zero the histogram, then accumulate it cooperatively (workgroup size ==
+      // TILE so workgroupId is the tile index).
+      nodes.push(clearHist().compute(histLen));
+      nodes.push(countKernel(inKey, shift)().compute(N, [TILE]));
       nodes.push(scanReduce().compute(SCAN_BLOCKS));
       nodes.push(scanBlocks().compute(1));
       nodes.push(scanDown().compute(SCAN_BLOCKS));
