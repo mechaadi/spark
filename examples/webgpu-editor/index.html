@@ -446,17 +446,18 @@
     await loadSource(urlParam ?? DEFAULT_SPLAT);
 
     // --- Render loop ------------------------------------------------------
-    // True GPU frame cost. renderAsync only *queues* commands and returns in
-    // ~1ms, so stats.js MS (CPU loop time) reads ~0 and never sees the real
-    // per-frame GPU work. Awaiting queue.onSubmittedWorkDone() blocks until the
-    // GPU has actually finished, giving the honest ms-per-frame the vsync'd fps
-    // hides (16.7ms = 60fps ceiling; anything above snaps to 30).
+    // Optional true-GPU-cost probe, enabled with ?gpums. renderAsync only
+    // *queues* commands and returns in ~1ms, so stats.js MS never sees the real
+    // per-frame GPU work; awaiting queue.onSubmittedWorkDone() blocks until the
+    // GPU has finished, giving the honest ms-per-frame the vsync'd fps hides.
+    // It is OFF by default because that await serializes CPU<->GPU and caps real
+    // throughput — leaving it on would mask actual speedups. Add ?gpums to read
+    // the number; otherwise the loop runs fully pipelined at native speed.
+    const measureGpu = new URLSearchParams(location.search).has("gpums");
     const gpuDevice = renderer.backend?.device;
-    // Rolling-MIN over a ~1s window. onSubmittedWorkDone() resolves on a
-    // macrotask with noisy scheduling latency (occasional 200ms+ spikes), so an
-    // average is meaningless. Spikes only ever add time, so the window minimum
-    // is the cleanest estimate of true GPU frame cost and tracks toggles within
-    // ~1s. Shown as "min" so the number is trustworthy for A/B deltas.
+    // Rolling-MIN over a ~1s window: onSubmittedWorkDone() resolves on a noisy
+    // macrotask (occasional 200ms+ spikes), and spikes only ever add time, so
+    // the window minimum is the cleanest estimate of true GPU frame cost.
     const gpuWindow = new Array(64).fill(0);
     let gpuFrame = 0;
     renderer.setAnimationLoop(async () => {
@@ -468,19 +469,21 @@
       }
       const t0 = performance.now();
       await spark.renderFrame(scene, camera);
-      try {
-        if (gpuDevice) await gpuDevice.queue.onSubmittedWorkDone();
-      } catch {}
-      const dt = performance.now() - t0;
-      gpuWindow[gpuFrame % gpuWindow.length] = dt;
-      if ((gpuFrame++ & 3) === 0) {
-        let mn = Infinity;
-        for (const t of gpuWindow) {
-          if (t > 0 && t < mn) mn = t;
+      if (measureGpu) {
+        try {
+          if (gpuDevice) await gpuDevice.queue.onSubmittedWorkDone();
+        } catch {}
+        const dt = performance.now() - t0;
+        gpuWindow[gpuFrame % gpuWindow.length] = dt;
+        if ((gpuFrame++ & 3) === 0) {
+          let mn = Infinity;
+          for (const t of gpuWindow) {
+            if (t > 0 && t < mn) mn = t;
+          }
+          badge.textContent =
+            `WebGPU\n${guiOptions.source}\n${guiOptions.splatCount} splats\n` +
+            `${Number.isFinite(mn) ? mn.toFixed(1) : "—"} ms GPU (min)`;
         }
-        badge.textContent =
-          `WebGPU\n${guiOptions.source}\n${guiOptions.splatCount} splats\n` +
-          `${Number.isFinite(mn) ? mn.toFixed(1) : "—"} ms GPU (min)`;
       }
       stats.end();
     });
