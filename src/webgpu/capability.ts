@@ -48,10 +48,16 @@ export async function canRequestWebGPUAdapter(): Promise<boolean> {
  * per-splat projection buffer is 64 bytes/splat, so a scene past ~2M splats
  * exceeds it and bind-group creation fails ("Binding size … is larger than the
  * maximum storage buffer binding size"). THREE forwards `requiredLimits`
- * verbatim to `requestDevice`, so the requested values must come from a real
- * adapter (asking for more than it supports would fail the device request).
- * Returns the adapter's true maxima, or undefined if WebGPU/the adapter is
- * unavailable.
+ * verbatim to `requestDevice`.
+ *
+ * Some drivers report a high `maxStorageBufferBindingSize` but then **refuse to
+ * grant it** in `requestDevice` — and because THREE silently falls back to its
+ * WebGL2 backend when the WebGPU device request fails, over-requesting would
+ * break WebGPU entirely (the WGSL path then crashes in the WebGL parser). So we
+ * verify the limits by actually requesting a device with them; if that fails we
+ * return undefined and the renderer keeps WebGPU at the default limits (fine for
+ * scenes up to ~2M splats). Returns undefined if WebGPU/the adapter is
+ * unavailable or the raised limits aren't grantable.
  */
 export async function requestWebGPUStorageLimits(): Promise<
   { maxStorageBufferBindingSize: number; maxBufferSize: number } | undefined
@@ -66,7 +72,12 @@ export async function requestWebGPUStorageLimits(): Promise<
       return undefined;
     }
     const { maxStorageBufferBindingSize, maxBufferSize } = adapter.limits;
-    return { maxStorageBufferBindingSize, maxBufferSize };
+    const requiredLimits = { maxStorageBufferBindingSize, maxBufferSize };
+    // Confirm the adapter actually grants these before handing them to THREE —
+    // otherwise a refused device request silently demotes us to WebGL2.
+    const device = await adapter.requestDevice({ requiredLimits });
+    (device as { destroy?: () => void }).destroy?.();
+    return requiredLimits;
   } catch {
     return undefined;
   }
