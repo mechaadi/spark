@@ -106,7 +106,9 @@
       isWebGPUAvailable,
       requestWebGPUStorageLimits,
     } from "@sparkjsdev/spark";
-    import { getAssetFileURL } from "../js/get-asset-url.js";
+
+    // Default scene shipped with the examples; override with ?url=<splat>.
+    const DEFAULT_SPLAT = "../scenes/Strawberry2.sog";
 
     const canvas = document.getElementById("canvas");
     const badge = document.getElementById("badge");
@@ -417,7 +419,7 @@
     // --- Initial scene ----------------------------------------------------
     // ?url=<splat> overrides; otherwise show the butterfly demo asset.
     const urlParam = new URLSearchParams(location.search).get("url");
-    await loadSource(urlParam ?? (await getAssetFileURL("butterfly.spz")));
+    await loadSource(urlParam ?? DEFAULT_SPLAT);
 
     // --- Render loop ------------------------------------------------------
     renderer.setAnimationLoop(async () => {

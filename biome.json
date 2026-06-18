@@ -20,6 +20,7 @@
       "examples/**/spark.module.js",
       "examples/**/*.json",
       "examples/**/pkg",
+      "examples/scenes",
       "webgpu-editor-site/spark.module.js"
     ]
   },

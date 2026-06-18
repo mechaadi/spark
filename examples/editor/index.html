@@ -802,11 +802,13 @@
     addBoundingBoxHelper(instructions);
     frame.add(instructions);
 
-    // Load URLs from query parameters if any
+    // Load URLs from query parameters if any, else the default scene.
     const urlsToLoad = parseURLsFromQuery();
     if (urlsToLoad.length > 0) {
       console.log(`Loading ${urlsToLoad.length} URLs from query parameters:`, urlsToLoad);
       loadFiles(urlsToLoad);
+    } else {
+      loadFiles(["../scenes/Strawberry2.sog"]);
     }
 
     // Focus the canvas initially for keyboard controls
