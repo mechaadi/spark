@@ -15134,6 +15134,14 @@ class WebGPUSplatRenderer extends THREE.Group {
     this.tmpCamPos = new THREE.Vector3();
     this.tmpSphere = new THREE.Vector3();
     this.tmpSize = new THREE.Vector2();
+    this.recomputePending = true;
+    this.prevModelView = new THREE.Matrix4();
+    this.prevProjection = new THREE.Matrix4();
+    this.prevSize = new THREE.Vector2(-1, -1);
+    this.prevStd = Number.NaN;
+    this.prevMinAlpha = Number.NaN;
+    this.prevMaxPixelRadius = Number.NaN;
+    this.prevMaxSplatScale = Number.NaN;
     this.maxStdDev = Math.sqrt(8);
     this.maxSplatScale = Number.POSITIVE_INFINITY;
     this.minAlpha = 0.5 * (1 / 255);
@@ -15379,6 +15387,7 @@ class WebGPUSplatRenderer extends THREE.Group {
       this.rawSort.configure(N);
       this.rawSortBound = false;
     }
+    this.recomputePending = true;
   }
   buildMaterial(MeshBasicNodeMaterial) {
     const tsl = this.tsl;
@@ -15501,6 +15510,21 @@ class WebGPUSplatRenderer extends THREE.Group {
     const r = this.boundRadius * scale + 1e-4;
     this.uDepthMin.value = Math.max(0, centerDist - r);
     this.uDepthMax.value = centerDist + r;
+    const viewChanged = this.recomputePending || // Keep recomputing until the raw sort has bound its buffers (the bind
+    // retries inside the sort block below, once the project pass has created
+    // them), so a view that goes static mid-bind still finishes binding.
+    this.rawSort != null && !this.rawSortBound || !this.prevModelView.equals(this.tmpModelView) || !this.prevProjection.equals(proj) || !this.prevSize.equals(this.tmpSize) || this.prevStd !== this.maxStdDev || this.prevMinAlpha !== this.minAlpha || this.prevMaxPixelRadius !== this.maxPixelRadius || this.prevMaxSplatScale !== this.maxSplatScale;
+    if (!viewChanged) {
+      return;
+    }
+    this.prevModelView.copy(this.tmpModelView);
+    this.prevProjection.copy(proj);
+    this.prevSize.copy(this.tmpSize);
+    this.prevStd = this.maxStdDev;
+    this.prevMinAlpha = this.minAlpha;
+    this.prevMaxPixelRadius = this.maxPixelRadius;
+    this.prevMaxSplatScale = this.maxSplatScale;
+    this.recomputePending = false;
     for (const node of this.computeNodes) {
       this.renderer.compute(node);
     }

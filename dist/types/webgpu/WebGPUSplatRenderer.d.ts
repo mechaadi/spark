@@ -82,6 +82,14 @@ export declare class WebGPUSplatRenderer extends THREE.Group {
     private readonly tmpCamPos;
     private readonly tmpSphere;
     private readonly tmpSize;
+    private recomputePending;
+    private readonly prevModelView;
+    private readonly prevProjection;
+    private readonly prevSize;
+    private prevStd;
+    private prevMinAlpha;
+    private prevMaxPixelRadius;
+    private prevMaxSplatScale;
     maxStdDev: number;
     /**
      * Cull splats whose largest object-space scale exceeds this, to trim the big

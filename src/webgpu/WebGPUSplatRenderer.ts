@@ -130,6 +130,22 @@ export class WebGPUSplatRenderer extends THREE.Group {
   private readonly tmpSphere = new THREE.Vector3();
   private readonly tmpSize = new THREE.Vector2();
 
+  // Recompute gate: project + sort only re-run when something that affects the
+  // projected/sorted result changed (camera, viewport, or a render param). A
+  // static view (the common case) reuses last frame's projStore + sorted idxA
+  // and just re-issues the raster — this is the single biggest per-frame saving,
+  // since project+sort over all N splats is the dominant cost (PlayCanvas does
+  // the same via a camera-movement epsilon). `recomputePending` forces the
+  // first frame after a (re)build; the prev* snapshot detects view/param change.
+  private recomputePending = true;
+  private readonly prevModelView = new THREE.Matrix4();
+  private readonly prevProjection = new THREE.Matrix4();
+  private readonly prevSize = new THREE.Vector2(-1, -1);
+  private prevStd = Number.NaN;
+  private prevMinAlpha = Number.NaN;
+  private prevMaxPixelRadius = Number.NaN;
+  private prevMaxSplatScale = Number.NaN;
+
   maxStdDev = Math.sqrt(8.0);
   /**
    * Cull splats whose largest object-space scale exceeds this, to trim the big
@@ -486,6 +502,8 @@ export class WebGPUSplatRenderer extends THREE.Group {
       this.rawSort.configure(N);
       this.rawSortBound = false;
     }
+    // Force the first frame after a (re)build to run project + sort.
+    this.recomputePending = true;
   }
 
   private buildMaterial(
@@ -640,6 +658,38 @@ export class WebGPUSplatRenderer extends THREE.Group {
     const r = this.boundRadius * scale + 1e-4;
     (this.uDepthMin as { value: number }).value = Math.max(0, centerDist - r);
     (this.uDepthMax as { value: number }).value = centerDist + r;
+
+    // --- Recompute gate -----------------------------------------------------
+    // Re-run project + sort only when the projected/sorted result would differ:
+    // the camera/model transform, the viewport, or a render param changed.
+    // Otherwise last frame's projStore + sorted idxA are still valid, so we skip
+    // both passes (the dominant per-frame cost) and let renderAsync re-issue the
+    // raster against the persisted GPU buffers. Damping is off, so a still
+    // camera produces bit-identical matrices frame to frame.
+    const viewChanged =
+      this.recomputePending ||
+      // Keep recomputing until the raw sort has bound its buffers (the bind
+      // retries inside the sort block below, once the project pass has created
+      // them), so a view that goes static mid-bind still finishes binding.
+      (this.rawSort != null && !this.rawSortBound) ||
+      !this.prevModelView.equals(this.tmpModelView) ||
+      !this.prevProjection.equals(proj) ||
+      !this.prevSize.equals(this.tmpSize) ||
+      this.prevStd !== this.maxStdDev ||
+      this.prevMinAlpha !== this.minAlpha ||
+      this.prevMaxPixelRadius !== this.maxPixelRadius ||
+      this.prevMaxSplatScale !== this.maxSplatScale;
+    if (!viewChanged) {
+      return;
+    }
+    this.prevModelView.copy(this.tmpModelView);
+    this.prevProjection.copy(proj);
+    this.prevSize.copy(this.tmpSize);
+    this.prevStd = this.maxStdDev;
+    this.prevMinAlpha = this.minAlpha;
+    this.prevMaxPixelRadius = this.maxPixelRadius;
+    this.prevMaxSplatScale = this.maxSplatScale;
+    this.recomputePending = false;
 
     // 1) Project every splat (TSL compute): writes the depth key into keyA and
     //    the identity payload into idxA (one submit).
