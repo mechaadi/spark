@@ -33,6 +33,13 @@
     const SIZE = 800;
     const renderer = new WebGPURenderer({ antialias: false });
     await renderer.init();
+    // WebGPURenderer falls back to WebGL2 if a WebGPU device can't be acquired;
+    // the WGSL splat path can't run there (it crashes in the GLSL parser).
+    if (renderer.backend?.isWebGPUBackend !== true) {
+      document.getElementById("info").textContent =
+        "WebGPU unavailable — fell back to WebGL2, which this page can't use.";
+      throw new Error("WebGPU device unavailable (fell back to WebGL2)");
+    }
     renderer.setSize(SIZE, SIZE);
     document.body.appendChild(renderer.domElement);
 
