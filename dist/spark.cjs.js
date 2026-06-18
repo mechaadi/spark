@@ -13310,6 +13310,7 @@ async function canRequestWebGPUAdapter() {
   }
 }
 async function requestWebGPUStorageLimits() {
+  var _a2;
   if (!isWebGPUAvailable()) {
     return void 0;
   }
@@ -13320,7 +13321,10 @@ async function requestWebGPUStorageLimits() {
       return void 0;
     }
     const { maxStorageBufferBindingSize, maxBufferSize } = adapter.limits;
-    return { maxStorageBufferBindingSize, maxBufferSize };
+    const requiredLimits = { maxStorageBufferBindingSize, maxBufferSize };
+    const device = await adapter.requestDevice({ requiredLimits });
+    (_a2 = device.destroy) == null ? void 0 : _a2.call(device);
+    return requiredLimits;
   } catch {
     return void 0;
   }
