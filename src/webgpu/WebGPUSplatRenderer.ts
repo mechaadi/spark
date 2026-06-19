@@ -70,6 +70,25 @@ export interface WebGPUSplatRendererOptions {
  * await spark.renderFrame(scene, camera);
  * ```
  */
+/**
+ * True if two 4x4 matrices differ by more than a small relative tolerance in
+ * any element. Used by the recompute gate to treat a "still" camera as
+ * unchanged despite the ~1e-6 per-frame drift OrbitControls introduces by
+ * round-tripping position through spherical coords. The relative term scales
+ * the threshold with each element's magnitude (translation can be large), and
+ * real interactive movement changes elements by >>1e-4, so it always trips.
+ */
+function matChanged(a: THREE.Matrix4, b: THREE.Matrix4): boolean {
+  const ea = a.elements;
+  const eb = b.elements;
+  for (let i = 0; i < 16; i++) {
+    if (Math.abs(ea[i] - eb[i]) > 1e-4 * (Math.abs(ea[i]) + Math.abs(eb[i]) + 1e-3)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export class WebGPUSplatRenderer extends THREE.Group {
   readonly isWebGPUSplatRenderer = true;
   readonly renderer: WebGPURenderer;
@@ -138,6 +157,9 @@ export class WebGPUSplatRenderer extends THREE.Group {
   // the same via a camera-movement epsilon). `recomputePending` forces the
   // first frame after a (re)build; the prev* snapshot detects view/param change.
   private recomputePending = true;
+  /** Debug counters: how often prepareFrame recomputes vs skips (gate). */
+  computeRuns = 0;
+  skipRuns = 0;
   private readonly prevModelView = new THREE.Matrix4();
   private readonly prevProjection = new THREE.Matrix4();
   private readonly prevSize = new THREE.Vector2(-1, -1);
@@ -297,7 +319,6 @@ export class WebGPUSplatRenderer extends THREE.Group {
       min,
       max,
       sqrt,
-      log,
     } = tsl;
     const N = this.numSplats;
 
@@ -432,22 +453,8 @@ export class WebGPUSplatRenderer extends THREE.Group {
             select(covA.greaterThanEqual(covD), vec2(1.0, 0.0), vec2(0.0, 1.0)),
           );
           const eigenVec2 = vec2(eigenVec1.y, eigenVec1.x.negate());
-          // Opacity-adaptive quad shrink (PlayCanvas clipCorner). The a<=1
-          // Gaussian profile decays as alpha*exp(-0.5*r^2); it crosses the
-          // alpha-discard floor (uMinAlpha) at r = sqrt(2*ln(alpha/uMinAlpha))
-          // sigma — usually well inside the fixed `adj`-sigma quad. Shrink the
-          // quad (and the fragment cutoff `cutoff`) to that radius so we stop
-          // rasterizing the outer ring that the fragment would discard anyway.
-          // +0.3 sigma margin keeps the visible edge intact; high-opacity (a>1)
-          // splats use the bounded profile, so leave their quad at full `adj`.
-          const cutoff = select(
-            alpha.greaterThan(1.0),
-            adj,
-            min(adj, sqrt(max(0.0, log(alpha.div(uMinAlpha)).mul(2.0))).add(0.3)),
-          ).toVar();
-          const clipRatio = cutoff.div(adj);
-          const scale1 = min(uMaxPixelRadius, adj.mul(sqrt(eigen1))).mul(clipRatio);
-          const scale2 = min(uMaxPixelRadius, adj.mul(sqrt(eigen2))).mul(clipRatio);
+          const scale1 = min(uMaxPixelRadius, adj.mul(sqrt(eigen1)));
+          const scale2 = min(uMaxPixelRadius, adj.mul(sqrt(eigen2)));
 
           // NDC offsets per unit quad corner along each ellipse axis.
           const twoOverRS = vec2(2.0, 2.0).div(uRenderSize);
@@ -493,7 +500,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
           projStore
             .element(base.add(2))
             .assign(vec4(rgbLin.x, rgbLin.y, rgbLin.z, alpha));
-          projStore.element(base.add(3)).assign(vec4(cutoff, 1.0, 0.0, 0.0));
+          projStore.element(base.add(3)).assign(vec4(adj, 1.0, 0.0, 0.0));
           // 16-bit far->near key, normalized to the model's view-depth range.
           keyAStore
             .element(i)
@@ -684,24 +691,32 @@ export class WebGPUSplatRenderer extends THREE.Group {
     // the camera/model transform, the viewport, or a render param changed.
     // Otherwise last frame's projStore + sorted idxA are still valid, so we skip
     // both passes (the dominant per-frame cost) and let renderAsync re-issue the
-    // raster against the persisted GPU buffers. Damping is off, so a still
-    // camera produces bit-identical matrices frame to frame.
+    // raster against the persisted GPU buffers.
+    //
+    // The matrix compare is EPSILON-tolerant, not exact: OrbitControls round-
+    // trips the camera through spherical coords every frame, so even a "still"
+    // camera drifts by ~1e-6 — an exact equals() never skips. We compare with a
+    // relative tolerance that absorbs that jitter but still catches real
+    // movement (orders of magnitude larger). The reference is NOT updated on a
+    // skip, so slow sub-threshold motion still accumulates and eventually fires.
     const viewChanged =
       this.recomputePending ||
       // Keep recomputing until the raw sort has bound its buffers (the bind
       // retries inside the sort block below, once the project pass has created
       // them), so a view that goes static mid-bind still finishes binding.
       (this.rawSort != null && !this.rawSortBound) ||
-      !this.prevModelView.equals(this.tmpModelView) ||
-      !this.prevProjection.equals(proj) ||
+      matChanged(this.prevModelView, this.tmpModelView) ||
+      matChanged(this.prevProjection, proj) ||
       !this.prevSize.equals(this.tmpSize) ||
       this.prevStd !== this.maxStdDev ||
       this.prevMinAlpha !== this.minAlpha ||
       this.prevMaxPixelRadius !== this.maxPixelRadius ||
       this.prevMaxSplatScale !== this.maxSplatScale;
     if (!viewChanged) {
+      this.skipRuns++;
       return;
     }
+    this.computeRuns++;
     this.prevModelView.copy(this.tmpModelView);
     this.prevProjection.copy(proj);
     this.prevSize.copy(this.tmpSize);

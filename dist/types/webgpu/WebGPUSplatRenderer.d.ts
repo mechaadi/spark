@@ -12,35 +12,6 @@ export interface WebGPUSplatRendererOptions {
      */
     enableSh?: boolean;
 }
-/**
- * WebGPU splat backend (Phases 2-4).
- *
- * Renders a SplatMesh entirely on the GPU through THREE.WebGPURenderer:
- * packed-splat storage-buffer upload, a per-splat compute project pass (full
- * anisotropic 2D-covariance projection + SH<=3 view-dependent color), an
- * **in-frame stable GPU radix sort** by depth, and an instanced raster draw into
- * the scene's shared depth buffer. The sort is produced and consumed in the same
- * frame — no GPU->CPU readback, no worker round-trip, no sort lag.
- *
- * Scope/caveats (documented, replaced in later phases):
- * - Sort is a stable tiled LSD radix over a 16-bit depth key (2 x 8-bit passes,
- *   parallel prefix sum). Stability matters: equal-depth splats must keep a
- *   deterministic draw order or alpha blending flickers. 16-bit depth is enough
- *   for the tested scenes; a wider key or workgroup-shared layout is a future
- *   option.
- * - Only `PackedSplats` residency is supported here; ExtSplats/Paged are routed
- *   to the WebGL session per the design (directives D4/D5/D6).
- *
- * Usage:
- * ```
- * const spark = new WebGPUSplatRenderer({ renderer });
- * await spark.init();
- * scene.add(spark);
- * spark.setSplatMesh(mesh);          // after await mesh.initialized
- * // render loop:
- * await spark.renderFrame(scene, camera);
- * ```
- */
 export declare class WebGPUSplatRenderer extends THREE.Group {
     readonly isWebGPUSplatRenderer = true;
     readonly renderer: WebGPURenderer;
@@ -83,6 +54,9 @@ export declare class WebGPUSplatRenderer extends THREE.Group {
     private readonly tmpSphere;
     private readonly tmpSize;
     private recomputePending;
+    /** Debug counters: how often prepareFrame recomputes vs skips (gate). */
+    computeRuns: number;
+    skipRuns: number;
     private readonly prevModelView;
     private readonly prevProjection;
     private readonly prevSize;

@@ -15132,6 +15132,16 @@ fn sparkDepthKey16( dist : f32, minDist : f32, maxDist : f32 ) -> u32 {
 }
 `
 );
+function matChanged(a, b) {
+  const ea = a.elements;
+  const eb = b.elements;
+  for (let i = 0; i < 16; i++) {
+    if (Math.abs(ea[i] - eb[i]) > 1e-4 * (Math.abs(ea[i]) + Math.abs(eb[i]) + 1e-3)) {
+      return true;
+    }
+  }
+  return false;
+}
 class WebGPUSplatRenderer extends THREE__namespace.Group {
   constructor(options) {
     super();
@@ -15175,6 +15185,8 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
     this.tmpSphere = new THREE__namespace.Vector3();
     this.tmpSize = new THREE__namespace.Vector2();
     this.recomputePending = true;
+    this.computeRuns = 0;
+    this.skipRuns = 0;
     this.prevModelView = new THREE__namespace.Matrix4();
     this.prevProjection = new THREE__namespace.Matrix4();
     this.prevSize = new THREE__namespace.Vector2(-1, -1);
@@ -15290,8 +15302,7 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
       select: select2,
       min: min2,
       max: max2,
-      sqrt: sqrt2,
-      log: log3
+      sqrt: sqrt2
     } = tsl;
     const N = this.numSplats;
     const unpackCenter = wgslFn(WGSL_UNPACK_CENTER);
@@ -15389,14 +15400,8 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
             select2(covA.greaterThanEqual(covD), vec22(1, 0), vec22(0, 1))
           );
           const eigenVec2 = vec22(eigenVec1.y, eigenVec1.x.negate());
-          const cutoff = select2(
-            alpha.greaterThan(1),
-            adj,
-            min2(adj, sqrt2(max2(0, log3(alpha.div(uMinAlpha)).mul(2))).add(0.3))
-          ).toVar();
-          const clipRatio = cutoff.div(adj);
-          const scale1 = min2(uMaxPixelRadius, adj.mul(sqrt2(eigen1))).mul(clipRatio);
-          const scale2 = min2(uMaxPixelRadius, adj.mul(sqrt2(eigen2))).mul(clipRatio);
+          const scale1 = min2(uMaxPixelRadius, adj.mul(sqrt2(eigen1)));
+          const scale2 = min2(uMaxPixelRadius, adj.mul(sqrt2(eigen2)));
           const twoOverRS = vec22(2, 2).div(uRenderSize);
           const axis1 = eigenVec1.mul(scale1).mul(twoOverRS);
           const axis2 = eigenVec2.mul(scale2).mul(twoOverRS);
@@ -15422,7 +15427,7 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
             lin.add(0.055).div(1.055).pow(2.4)
           );
           projStore.element(base.add(2)).assign(vec42(rgbLin.x, rgbLin.y, rgbLin.z, alpha));
-          projStore.element(base.add(3)).assign(vec42(cutoff, 1, 0, 0));
+          projStore.element(base.add(3)).assign(vec42(adj, 1, 0, 0));
           keyAStore.element(i).assign(depthKey16(viewC.length(), uDepthMin, uDepthMax));
         });
       });
@@ -15560,10 +15565,12 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
     const viewChanged = this.recomputePending || // Keep recomputing until the raw sort has bound its buffers (the bind
     // retries inside the sort block below, once the project pass has created
     // them), so a view that goes static mid-bind still finishes binding.
-    this.rawSort != null && !this.rawSortBound || !this.prevModelView.equals(this.tmpModelView) || !this.prevProjection.equals(proj) || !this.prevSize.equals(this.tmpSize) || this.prevStd !== this.maxStdDev || this.prevMinAlpha !== this.minAlpha || this.prevMaxPixelRadius !== this.maxPixelRadius || this.prevMaxSplatScale !== this.maxSplatScale;
+    this.rawSort != null && !this.rawSortBound || matChanged(this.prevModelView, this.tmpModelView) || matChanged(this.prevProjection, proj) || !this.prevSize.equals(this.tmpSize) || this.prevStd !== this.maxStdDev || this.prevMinAlpha !== this.minAlpha || this.prevMaxPixelRadius !== this.maxPixelRadius || this.prevMaxSplatScale !== this.maxSplatScale;
     if (!viewChanged) {
+      this.skipRuns++;
       return;
     }
+    this.computeRuns++;
     this.prevModelView.copy(this.tmpModelView);
     this.prevProjection.copy(proj);
     this.prevSize.copy(this.tmpSize);

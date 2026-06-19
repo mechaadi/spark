@@ -150,6 +150,7 @@
 
     const spark = new WebGPUSplatRenderer({ renderer, enableSh: true });
     await spark.init();
+    window.spark = spark; // debug handle
     scene.add(spark);
     // Debug: ?nosort skips the depth sort (renders wrong, but isolates sort cost
     // for an fps A/B). Also toggleable live in the Splat rendering panel.
