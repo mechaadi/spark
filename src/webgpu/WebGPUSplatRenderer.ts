@@ -297,6 +297,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
       min,
       max,
       sqrt,
+      log,
     } = tsl;
     const N = this.numSplats;
 
@@ -431,8 +432,22 @@ export class WebGPUSplatRenderer extends THREE.Group {
             select(covA.greaterThanEqual(covD), vec2(1.0, 0.0), vec2(0.0, 1.0)),
           );
           const eigenVec2 = vec2(eigenVec1.y, eigenVec1.x.negate());
-          const scale1 = min(uMaxPixelRadius, adj.mul(sqrt(eigen1)));
-          const scale2 = min(uMaxPixelRadius, adj.mul(sqrt(eigen2)));
+          // Opacity-adaptive quad shrink (PlayCanvas clipCorner). The a<=1
+          // Gaussian profile decays as alpha*exp(-0.5*r^2); it crosses the
+          // alpha-discard floor (uMinAlpha) at r = sqrt(2*ln(alpha/uMinAlpha))
+          // sigma — usually well inside the fixed `adj`-sigma quad. Shrink the
+          // quad (and the fragment cutoff `cutoff`) to that radius so we stop
+          // rasterizing the outer ring that the fragment would discard anyway.
+          // +0.3 sigma margin keeps the visible edge intact; high-opacity (a>1)
+          // splats use the bounded profile, so leave their quad at full `adj`.
+          const cutoff = select(
+            alpha.greaterThan(1.0),
+            adj,
+            min(adj, sqrt(max(0.0, log(alpha.div(uMinAlpha)).mul(2.0))).add(0.3)),
+          ).toVar();
+          const clipRatio = cutoff.div(adj);
+          const scale1 = min(uMaxPixelRadius, adj.mul(sqrt(eigen1))).mul(clipRatio);
+          const scale2 = min(uMaxPixelRadius, adj.mul(sqrt(eigen2))).mul(clipRatio);
 
           // NDC offsets per unit quad corner along each ellipse axis.
           const twoOverRS = vec2(2.0, 2.0).div(uRenderSize);
@@ -478,7 +493,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
           projStore
             .element(base.add(2))
             .assign(vec4(rgbLin.x, rgbLin.y, rgbLin.z, alpha));
-          projStore.element(base.add(3)).assign(vec4(adj, 1.0, 0.0, 0.0));
+          projStore.element(base.add(3)).assign(vec4(cutoff, 1.0, 0.0, 0.0));
           // 16-bit far->near key, normalized to the model's view-depth range.
           keyAStore
             .element(i)

@@ -15290,7 +15290,8 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
       select: select2,
       min: min2,
       max: max2,
-      sqrt: sqrt2
+      sqrt: sqrt2,
+      log: log3
     } = tsl;
     const N = this.numSplats;
     const unpackCenter = wgslFn(WGSL_UNPACK_CENTER);
@@ -15388,8 +15389,14 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
             select2(covA.greaterThanEqual(covD), vec22(1, 0), vec22(0, 1))
           );
           const eigenVec2 = vec22(eigenVec1.y, eigenVec1.x.negate());
-          const scale1 = min2(uMaxPixelRadius, adj.mul(sqrt2(eigen1)));
-          const scale2 = min2(uMaxPixelRadius, adj.mul(sqrt2(eigen2)));
+          const cutoff = select2(
+            alpha.greaterThan(1),
+            adj,
+            min2(adj, sqrt2(max2(0, log3(alpha.div(uMinAlpha)).mul(2))).add(0.3))
+          ).toVar();
+          const clipRatio = cutoff.div(adj);
+          const scale1 = min2(uMaxPixelRadius, adj.mul(sqrt2(eigen1))).mul(clipRatio);
+          const scale2 = min2(uMaxPixelRadius, adj.mul(sqrt2(eigen2))).mul(clipRatio);
           const twoOverRS = vec22(2, 2).div(uRenderSize);
           const axis1 = eigenVec1.mul(scale1).mul(twoOverRS);
           const axis2 = eigenVec2.mul(scale2).mul(twoOverRS);
@@ -15415,7 +15422,7 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
             lin.add(0.055).div(1.055).pow(2.4)
           );
           projStore.element(base.add(2)).assign(vec42(rgbLin.x, rgbLin.y, rgbLin.z, alpha));
-          projStore.element(base.add(3)).assign(vec42(adj, 1, 0, 0));
+          projStore.element(base.add(3)).assign(vec42(cutoff, 1, 0, 0));
           keyAStore.element(i).assign(depthKey16(viewC.length(), uDepthMin, uDepthMax));
         });
       });
