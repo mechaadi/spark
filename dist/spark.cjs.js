@@ -15448,8 +15448,7 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
       float: float2,
       varyingProperty,
       storage,
-      mix: mix2,
-      select: select2
+      mix: mix2
     } = tsl;
     const projStore = storage(
       this.projAttr,
@@ -15496,10 +15495,11 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
       });
       const a = vColor.w;
       const fall = z2.mul(-0.5).exp();
-      const aLow = a.mul(fall);
-      const expo = a.mul(a).sub(1).div(Math.E).exp();
-      const aHigh = float2(1).sub(float2(1).sub(fall).pow(expo));
-      const alpha = select2(a.greaterThan(1), aHigh, aLow).toVar();
+      const alpha = a.mul(fall).toVar();
+      If(a.greaterThan(1), () => {
+        const expo = a.mul(a).sub(1).div(Math.E).exp();
+        alpha.assign(float2(1).sub(float2(1).sub(fall).pow(expo)));
+      });
       If(alpha.lessThan(uMinAlpha.value), () => {
         Discard();
       });

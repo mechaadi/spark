@@ -536,7 +536,6 @@ export class WebGPUSplatRenderer extends THREE.Group {
       varyingProperty,
       storage,
       mix,
-      select,
     } = tsl;
 
     const projStore = storage(
@@ -595,10 +594,16 @@ export class WebGPUSplatRenderer extends THREE.Group {
       });
       const a = vColor.w;
       const fall = z2.mul(-0.5).exp();
-      const aLow = a.mul(fall);
-      const expo = a.mul(a).sub(1.0).div(Math.E).exp();
-      const aHigh = float(1.0).sub(float(1.0).sub(fall).pow(expo));
-      const alpha = select(a.greaterThan(1.0), aHigh, aLow).toVar();
+      // a<=1 is the common plain-Gaussian profile; compute it unconditionally.
+      const alpha = a.mul(fall).toVar();
+      // a>1 (high-opacity / LOD-inflated) uses the bounded profile. `a` is
+      // constant across a splat's quad, so this branch is coherent per splat —
+      // the common a<=1 path skips the extra exp + pow that the old `select`
+      // (which evaluates both arms) paid on every fragment.
+      If(a.greaterThan(1.0), () => {
+        const expo = a.mul(a).sub(1.0).div(Math.E).exp();
+        alpha.assign(float(1.0).sub(float(1.0).sub(fall).pow(expo)));
+      });
       If(alpha.lessThan(uMinAlpha.value), () => {
         Discard();
       });
