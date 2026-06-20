@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Spark WebGPU benchmark harness</title>
+  <style>
+    html, body { margin: 0; background: #111; color: #ddd; font: 13px monospace; }
+    #canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; }
+    #log { position: fixed; left: 8px; top: 8px; white-space: pre; z-index: 2;
+           background: rgba(0,0,0,0.6); padding: 8px; border-radius: 4px;
+           max-height: 90vh; overflow: auto; }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "../js/vendor/three/build/three.webgpu.js",
+        "three/webgpu": "../js/vendor/three/build/three.webgpu.js",
+        "three/tsl": "../js/vendor/three/build/three.tsl.js",
+        "three/addons/": "../js/vendor/three/examples/jsm/",
+        "@sparkjsdev/spark": "../../dist/spark.module.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="log">booting…</div>
+  <script type="module">
+    import * as THREE from "three";
+    import { WebGPURenderer } from "three/webgpu";
+    import {
+      SplatMesh,
+      WebGPUSplatRenderer,
+      isWebGPUAvailable,
+      requestWebGPUStorageLimits,
+    } from "@sparkjsdev/spark";
+
+    const logEl = document.getElementById("log");
+    const log = (m) => { logEl.textContent = m; console.log(m); };
+
+    const params = new URLSearchParams(location.search);
+    const N = Number(params.get("n") ?? 200000);
+    const W = Number(params.get("w") ?? 1280);
+    const H = Number(params.get("h") ?? 720);
+    // World-space splat radius; bigger => more overdraw (more fill-bound).
+    const SPLAT = Number(params.get("splat") ?? 0.035);
+
+    if (!isWebGPUAvailable()) { log("WebGPU unavailable"); throw new Error("no webgpu"); }
+
+    const canvas = document.getElementById("canvas");
+    const requiredLimits = (await requestWebGPUStorageLimits()) ?? {};
+    const renderer = new WebGPURenderer({ canvas, antialias: false, requiredLimits });
+    await renderer.init();
+    if (renderer.backend?.isWebGPUBackend !== true) {
+      log("renderer fell back to WebGL2 — WebGPU device unavailable");
+      throw new Error("webgl2 fallback");
+    }
+    const device = renderer.backend.device;
+    renderer.setSize(W, H, false);
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color("#000000");
+    const camera = new THREE.PerspectiveCamera(60, W / H, 0.01, 100);
+
+    const spark = new WebGPUSplatRenderer({ renderer, enableSh: false });
+    await spark.init();
+    scene.add(spark);
+
+    // --- Synthetic splat cloud: N gaussians in a unit ball, deterministic. -----
+    // A simple LCG keeps scene identical across reloads so configs are comparable.
+    let seed = 1234567;
+    const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+    log(`building ${N.toLocaleString()} splats…`);
+    const mesh = new SplatMesh({
+      constructSplats: (splats) => {
+        const ctr = new THREE.Vector3();
+        const sc = new THREE.Vector3();
+        const q = new THREE.Quaternion(0, 0, 0, 1);
+        const col = new THREE.Color();
+        for (let i = 0; i < N; i++) {
+          let x, y, z, r2;
+          do { x = rnd() * 2 - 1; y = rnd() * 2 - 1; z = rnd() * 2 - 1; r2 = x*x + y*y + z*z; }
+          while (r2 > 1);
+          ctr.set(x, y, z);
+          const s = SPLAT * (0.6 + rnd());
+          sc.set(s, s, s);
+          col.setHSL(rnd(), 0.7, 0.5);
+          splats.pushSplat(ctr, sc, q, 0.85, col);
+        }
+      },
+    });
+    await mesh.initialized;
+    spark.setSplatMesh(mesh);
+    log(`built ${(mesh.packedSplats?.numSplats ?? 0).toLocaleString()} splats. ready.`);
+
+    // --- Measurement: drive frames manually (no rAF), time true GPU cost. -------
+    // Each frame queues project+sort+raster then awaits the GPU. min over the
+    // window is the cleanest cost estimate (scheduling spikes only add). The gate
+    // counters in the result confirm static (skipRuns high) vs moving (computeRuns
+    // high). `moving` rotates the camera each frame (> the gate's epsilon) so
+    // project+sort re-run; `static` holds it so the gate skips them.
+    function placeCamera(angle, dist) {
+      camera.position.set(Math.sin(angle) * dist, 0, Math.cos(angle) * dist);
+      camera.lookAt(0, 0, 0);
+      camera.updateProjectionMatrix();
+      camera.updateMatrixWorld(true);
+    }
+
+    // Batched-throughput measurement. Per-frame onSubmittedWorkDone() has noisy
+    // macrotask latency (~2x run-to-run on software), so instead queue `frames`
+    // submits and await the GPU ONCE at the end: total / frames amortizes the
+    // fixed latency and the GPU pipelines the work, giving a stable per-frame
+    // cost. Repeat `reps` times and keep the fastest (min) batch — background
+    // scheduling only ever slows a batch, so the min is the cleanest estimate.
+    async function measure(cfg = {}) {
+      const {
+        frames = 60, warmup = 20, reps = 3, moving = false, skipSort = false,
+        stddev = 2.5, scale = 1, dist = 2.0, step = 0.006,
+      } = cfg;
+      spark.skipSort = skipSort;
+      spark.maxStdDev = stddev;
+      renderer.setPixelRatio(scale);
+      renderer.setSize(W, H, false);
+      let angle = 0.0;
+      for (let i = 0; i < warmup; i++) {
+        if (moving) angle += step;
+        placeCamera(angle, dist);
+        await spark.renderFrame(scene, camera);
+      }
+      await device.queue.onSubmittedWorkDone();
+      spark.computeRuns = 0; spark.skipRuns = 0;
+      let best = Infinity;
+      for (let r = 0; r < reps; r++) {
+        const t0 = performance.now();
+        for (let i = 0; i < frames; i++) {
+          if (moving) angle += step;
+          placeCamera(angle, dist);
+          await spark.renderFrame(scene, camera);
+        }
+        await device.queue.onSubmittedWorkDone();
+        best = Math.min(best, (performance.now() - t0) / frames);
+      }
+      return {
+        ms: +best.toFixed(2),
+        fps: +(1000 / best).toFixed(1),
+        computeRuns: spark.computeRuns, skipRuns: spark.skipRuns,
+        cfg: { moving, skipSort, stddev, scale, dist },
+      };
+    }
+
+    window.bench = { measure, spark, renderer, scene, camera, N, W, H };
+
+    // Auto-run a default sweep so a bare page load already yields numbers.
+    window.__bench = { status: "running", results: null };
+    (async () => {
+      const out = {};
+      out.static_s1 = await measure({ moving: false, scale: 1, dist: 1.3 });
+      out.static_s2 = await measure({ moving: false, scale: 2, dist: 1.3 });
+      out.moving_s1 = await measure({ moving: true, scale: 1, dist: 1.3 });
+      out.moving_s1_nosort = await measure({ moving: true, skipSort: true, scale: 1, dist: 1.3 });
+      window.__bench = { status: "done", results: out };
+      const fmt = (r) => `${r.ms}ms ${r.fps}fps  (compute ${r.computeRuns}/skip ${r.skipRuns})`;
+      log(
+        `N=${N.toLocaleString()} ${W}x${H}\n` +
+        `static  s1 d1.3: ${fmt(out.static_s1)}\n` +
+        `static  s2 d1.3: ${fmt(out.static_s2)}\n` +
+        `moving  s1 d1.3: ${fmt(out.moving_s1)}\n` +
+        `moving  s1 nosort: ${fmt(out.moving_s1_nosort)}`,
+      );
+    })();
+  </script>
+</body>
+</html>
