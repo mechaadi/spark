@@ -130,6 +130,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
   private uShMax: { value: THREE.Vector3 } | null = null;
   private uMaxStdDev: { value: number } | null = null;
   private uMinAlpha: { value: number } | null = null;
+  private uShrink: { value: number } | null = null;
   private uMaxPixelRadius: { value: number } | null = null;
   private uMaxSplatScale: { value: number } | null = null;
   // Radial view-distance range of the model, recomputed per frame from the
@@ -160,6 +161,10 @@ export class WebGPUSplatRenderer extends THREE.Group {
   /** Debug counters: how often prepareFrame recomputes vs skips (gate). */
   computeRuns = 0;
   skipRuns = 0;
+  /** Opacity-adaptive quad shrink (PlayCanvas clipCorner). Cuts overdraw for
+   * translucent splats; exposed so it can be A/B'd at runtime. */
+  shrinkQuads = true;
+  private prevShrink = true;
   private readonly prevModelView = new THREE.Matrix4();
   private readonly prevProjection = new THREE.Matrix4();
   private readonly prevSize = new THREE.Vector2(-1, -1);
@@ -319,6 +324,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
       min,
       max,
       sqrt,
+      log,
     } = tsl;
     const N = this.numSplats;
 
@@ -348,6 +354,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
     const uMinAlpha = uniform(this.minAlpha);
     const uMaxPixelRadius = uniform(this.maxPixelRadius);
     const uMaxSplatScale = uniform(1e30);
+    const uShrink = uniform(1.0);
     const uDepthMin = uniform(0.0);
     const uDepthMax = uniform(1.0);
     this.uDepthMin = uDepthMin as unknown as { value: number };
@@ -363,6 +370,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
     this.uMinAlpha = uMinAlpha as unknown as { value: number };
     this.uMaxPixelRadius = uMaxPixelRadius as unknown as { value: number };
     this.uMaxSplatScale = uMaxSplatScale as unknown as { value: number };
+    this.uShrink = uShrink as unknown as { value: number };
 
     // SH evaluation kernels + storage stores (only the bands the mesh has).
     const sh1Eval = this.numSh >= 1 ? wgslFn(WGSL_EVAL_SH1) : null;
@@ -453,8 +461,29 @@ export class WebGPUSplatRenderer extends THREE.Group {
             select(covA.greaterThanEqual(covD), vec2(1.0, 0.0), vec2(0.0, 1.0)),
           );
           const eigenVec2 = vec2(eigenVec1.y, eigenVec1.x.negate());
-          const scale1 = min(uMaxPixelRadius, adj.mul(sqrt(eigen1)));
-          const scale2 = min(uMaxPixelRadius, adj.mul(sqrt(eigen2)));
+          // Opacity-adaptive quad shrink (PlayCanvas clipCorner). The a<=1
+          // Gaussian decays as alpha*exp(-0.5*r^2) and crosses the alpha-discard
+          // floor (uMinAlpha) at r = sqrt(2*ln(alpha/uMinAlpha)) sigma — for
+          // translucent splats well inside the `adj`-sigma quad. Shrink the quad
+          // and the fragment cutoff to there (+0.3 sigma margin) so the discarded
+          // outer ring is never rasterized — fewer fragments, no visible change.
+          // While static the project pass is gated, so this cost is paid only
+          // while moving (matching SuperSplat, which shrinks in its vertex shader
+          // every frame). High-opacity (a>1) splats keep the bounded-profile quad.
+          const shrunk = min(
+            adj,
+            sqrt(max(0.0, log(alpha.div(uMinAlpha)).mul(2.0))).add(0.3),
+          );
+          // a>1 keeps the bounded-profile quad; uShrink=0 disables the shrink
+          // entirely (for A/B), keeping the full `adj`-sigma quad.
+          const cutoff = select(
+            alpha.greaterThan(1.0).or(uShrink.lessThan(0.5)),
+            adj,
+            shrunk,
+          ).toVar();
+          const clipRatio = cutoff.div(adj);
+          const scale1 = min(uMaxPixelRadius, adj.mul(sqrt(eigen1))).mul(clipRatio);
+          const scale2 = min(uMaxPixelRadius, adj.mul(sqrt(eigen2))).mul(clipRatio);
 
           // NDC offsets per unit quad corner along each ellipse axis.
           const twoOverRS = vec2(2.0, 2.0).div(uRenderSize);
@@ -500,7 +529,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
           projStore
             .element(base.add(2))
             .assign(vec4(rgbLin.x, rgbLin.y, rgbLin.z, alpha));
-          projStore.element(base.add(3)).assign(vec4(adj, 1.0, 0.0, 0.0));
+          projStore.element(base.add(3)).assign(vec4(cutoff, 1.0, 0.0, 0.0));
           // 16-bit far->near key, normalized to the model's view-depth range.
           keyAStore
             .element(i)
@@ -665,6 +694,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
     (this.uMaxStdDev as { value: number }).value = this.maxStdDev;
     (this.uMinAlpha as { value: number }).value = this.minAlpha;
     (this.uMaxPixelRadius as { value: number }).value = this.maxPixelRadius;
+    (this.uShrink as { value: number }).value = this.shrinkQuads ? 1 : 0;
     (this.uMaxSplatScale as { value: number }).value = Number.isFinite(
       this.maxSplatScale,
     )
@@ -710,6 +740,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
       !this.prevSize.equals(this.tmpSize) ||
       this.prevStd !== this.maxStdDev ||
       this.prevMinAlpha !== this.minAlpha ||
+      this.prevShrink !== this.shrinkQuads ||
       this.prevMaxPixelRadius !== this.maxPixelRadius ||
       this.prevMaxSplatScale !== this.maxSplatScale;
     if (!viewChanged) {
@@ -722,6 +753,7 @@ export class WebGPUSplatRenderer extends THREE.Group {
     this.prevSize.copy(this.tmpSize);
     this.prevStd = this.maxStdDev;
     this.prevMinAlpha = this.minAlpha;
+    this.prevShrink = this.shrinkQuads;
     this.prevMaxPixelRadius = this.maxPixelRadius;
     this.prevMaxSplatScale = this.maxSplatScale;
     this.recomputePending = false;

@@ -15171,6 +15171,7 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
     this.uShMax = null;
     this.uMaxStdDev = null;
     this.uMinAlpha = null;
+    this.uShrink = null;
     this.uMaxPixelRadius = null;
     this.uMaxSplatScale = null;
     this.uDepthMin = null;
@@ -15187,6 +15188,8 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
     this.recomputePending = true;
     this.computeRuns = 0;
     this.skipRuns = 0;
+    this.shrinkQuads = true;
+    this.prevShrink = true;
     this.prevModelView = new THREE__namespace.Matrix4();
     this.prevProjection = new THREE__namespace.Matrix4();
     this.prevSize = new THREE__namespace.Vector2(-1, -1);
@@ -15302,7 +15305,8 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
       select: select2,
       min: min2,
       max: max2,
-      sqrt: sqrt2
+      sqrt: sqrt2,
+      log: log3
     } = tsl;
     const N = this.numSplats;
     const unpackCenter = wgslFn(WGSL_UNPACK_CENTER);
@@ -15327,6 +15331,7 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
     const uMinAlpha = uniform2(this.minAlpha);
     const uMaxPixelRadius = uniform2(this.maxPixelRadius);
     const uMaxSplatScale = uniform2(1e30);
+    const uShrink = uniform2(1);
     const uDepthMin = uniform2(0);
     const uDepthMax = uniform2(1);
     this.uDepthMin = uDepthMin;
@@ -15342,6 +15347,7 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
     this.uMinAlpha = uMinAlpha;
     this.uMaxPixelRadius = uMaxPixelRadius;
     this.uMaxSplatScale = uMaxSplatScale;
+    this.uShrink = uShrink;
     const sh1Eval = this.numSh >= 1 ? wgslFn(WGSL_EVAL_SH1) : null;
     const sh2Eval = this.numSh >= 2 ? wgslFn(WGSL_EVAL_SH2) : null;
     const sh3Eval = this.numSh >= 3 ? wgslFn(WGSL_EVAL_SH3) : null;
@@ -15400,8 +15406,18 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
             select2(covA.greaterThanEqual(covD), vec22(1, 0), vec22(0, 1))
           );
           const eigenVec2 = vec22(eigenVec1.y, eigenVec1.x.negate());
-          const scale1 = min2(uMaxPixelRadius, adj.mul(sqrt2(eigen1)));
-          const scale2 = min2(uMaxPixelRadius, adj.mul(sqrt2(eigen2)));
+          const shrunk = min2(
+            adj,
+            sqrt2(max2(0, log3(alpha.div(uMinAlpha)).mul(2))).add(0.3)
+          );
+          const cutoff = select2(
+            alpha.greaterThan(1).or(uShrink.lessThan(0.5)),
+            adj,
+            shrunk
+          ).toVar();
+          const clipRatio = cutoff.div(adj);
+          const scale1 = min2(uMaxPixelRadius, adj.mul(sqrt2(eigen1))).mul(clipRatio);
+          const scale2 = min2(uMaxPixelRadius, adj.mul(sqrt2(eigen2))).mul(clipRatio);
           const twoOverRS = vec22(2, 2).div(uRenderSize);
           const axis1 = eigenVec1.mul(scale1).mul(twoOverRS);
           const axis2 = eigenVec2.mul(scale2).mul(twoOverRS);
@@ -15427,7 +15443,7 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
             lin.add(0.055).div(1.055).pow(2.4)
           );
           projStore.element(base.add(2)).assign(vec42(rgbLin.x, rgbLin.y, rgbLin.z, alpha));
-          projStore.element(base.add(3)).assign(vec42(adj, 1, 0, 0));
+          projStore.element(base.add(3)).assign(vec42(cutoff, 1, 0, 0));
           keyAStore.element(i).assign(depthKey16(viewC.length(), uDepthMin, uDepthMax));
         });
       });
@@ -15548,6 +15564,7 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
     this.uMaxStdDev.value = this.maxStdDev;
     this.uMinAlpha.value = this.minAlpha;
     this.uMaxPixelRadius.value = this.maxPixelRadius;
+    this.uShrink.value = this.shrinkQuads ? 1 : 0;
     this.uMaxSplatScale.value = Number.isFinite(
       this.maxSplatScale
     ) ? this.maxSplatScale : 1e30;
@@ -15565,7 +15582,7 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
     const viewChanged = this.recomputePending || // Keep recomputing until the raw sort has bound its buffers (the bind
     // retries inside the sort block below, once the project pass has created
     // them), so a view that goes static mid-bind still finishes binding.
-    this.rawSort != null && !this.rawSortBound || matChanged(this.prevModelView, this.tmpModelView) || matChanged(this.prevProjection, proj) || !this.prevSize.equals(this.tmpSize) || this.prevStd !== this.maxStdDev || this.prevMinAlpha !== this.minAlpha || this.prevMaxPixelRadius !== this.maxPixelRadius || this.prevMaxSplatScale !== this.maxSplatScale;
+    this.rawSort != null && !this.rawSortBound || matChanged(this.prevModelView, this.tmpModelView) || matChanged(this.prevProjection, proj) || !this.prevSize.equals(this.tmpSize) || this.prevStd !== this.maxStdDev || this.prevMinAlpha !== this.minAlpha || this.prevShrink !== this.shrinkQuads || this.prevMaxPixelRadius !== this.maxPixelRadius || this.prevMaxSplatScale !== this.maxSplatScale;
     if (!viewChanged) {
       this.skipRuns++;
       return;
@@ -15576,6 +15593,7 @@ class WebGPUSplatRenderer extends THREE__namespace.Group {
     this.prevSize.copy(this.tmpSize);
     this.prevStd = this.maxStdDev;
     this.prevMinAlpha = this.minAlpha;
+    this.prevShrink = this.shrinkQuads;
     this.prevMaxPixelRadius = this.maxPixelRadius;
     this.prevMaxSplatScale = this.maxSplatScale;
     this.recomputePending = false;

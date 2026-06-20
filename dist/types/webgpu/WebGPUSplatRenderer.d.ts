@@ -40,6 +40,7 @@ export declare class WebGPUSplatRenderer extends THREE.Group {
     private uShMax;
     private uMaxStdDev;
     private uMinAlpha;
+    private uShrink;
     private uMaxPixelRadius;
     private uMaxSplatScale;
     private uDepthMin;
@@ -57,6 +58,10 @@ export declare class WebGPUSplatRenderer extends THREE.Group {
     /** Debug counters: how often prepareFrame recomputes vs skips (gate). */
     computeRuns: number;
     skipRuns: number;
+    /** Opacity-adaptive quad shrink (PlayCanvas clipCorner). Cuts overdraw for
+     * translucent splats; exposed so it can be A/B'd at runtime. */
+    shrinkQuads: boolean;
+    private prevShrink;
     private readonly prevModelView;
     private readonly prevProjection;
     private readonly prevSize;
